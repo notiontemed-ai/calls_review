@@ -126,21 +126,11 @@ function onOpen() {
     .addItem('Пересоздать лист записей', 'resetMangoCallsSheet')
     .addItem('Сканировать папку записей', 'scanMangoRecordingsFolder')
     .addSeparator()
-    .addItem('Создать / проверить лист Промпт', 'setupPromptSheet')
-    .addItem('Пересоздать лист Промпт с базовыми правилами', 'resetPromptSheetWithDefaultRules')
-    .addSeparator()
     .addItem('Отправить новые звонки в n8n', 'sendNewCallsToN8n')
     .addItem('Отправить выделенные строки в n8n', 'sendSelectedRowsToN8n')
     .addSeparator()
     .addItem('Создать задачи Bitrix по проблемным звонкам', 'createBitrixTasksForProblemCalls')
     .addItem('Создать задачи Bitrix по выделенным строкам', 'createBitrixTasksForSelectedRows')
-    .addSeparator()
-    .addItem('Настройки: задать n8n webhook', 'setN8nWebhookUrl')
-    .addItem('Настройки: задать Bitrix webhook', 'setBitrixWebhookBaseUrl')
-    .addItem('Настройки: задать ответственного Bitrix', 'setBitrixResponsibleId')
-    .addItem('Настройки: задать callback secret', 'setCallbackSecret')
-    .addItem('Настройки: задать URL Web App callback', 'setCallbackWebAppUrl')
-    .addItem('Настройки: показать свойства', 'showScriptProperties')
     .addSeparator()
     .addItem('Тест: исправить имя из выделенной ячейки', 'testFixSelectedCell')
     .addToUi();
@@ -182,244 +172,9 @@ function resetMangoCallsSheet() {
   SpreadsheetApp.getActive().toast('Лист пересоздан.');
 }
 
-function setupPromptSheet() {
-  const ss = SpreadsheetApp.getActive();
-  let sheet = ss.getSheetByName(CONFIG.PROMPT_SHEET_NAME);
-
-  if (!sheet) {
-    sheet = ss.insertSheet(CONFIG.PROMPT_SHEET_NAME);
-  }
-
-  ensureSheetHeaders_(sheet, PROMPT_HEADERS);
-
-  if (sheet.getLastRow() < 2 || !promptSheetHasStructuredRows_(sheet)) {
-    appendDefaultPromptRows_(sheet);
-  }
-
-  sheet.setFrozenRows(1);
-  sheet.autoResizeColumns(1, Math.min(PROMPT_HEADERS.length, 12));
-
-  SpreadsheetApp.getActive().toast('Лист «Промпт» проверен. Пользовательские строки не очищались.');
-}
-
-function promptSheetHasStructuredRows_(sheet) {
-  if (sheet.getLastRow() < 2) return false;
-
-  const headerMap = getHeaderMap_(sheet);
-  if (!headerMap.block_type || !headerMap.rule_id) return false;
-
-  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-
-  return values.some(row => {
-    const blockType = String(row[headerMap.block_type - 1] || '').trim().toUpperCase();
-    const ruleId = String(row[headerMap.rule_id - 1] || '').trim();
-    return ruleId && ['CONFIG', 'GENERAL', 'STAGE'].indexOf(blockType) !== -1;
-  });
-}
-
-function resetPromptSheetWithDefaultRules() {
-  const ui = SpreadsheetApp.getUi();
-  const response = ui.alert(
-    'Пересоздать лист «Промпт»?',
-    'Все текущие правила и настройки на листе «Промпт» будут удалены и заменены базовыми правилами calls_v2.',
-    ui.ButtonSet.YES_NO
-  );
-
-  if (response !== ui.Button.YES) return;
-
-  const ss = SpreadsheetApp.getActive();
-  let sheet = ss.getSheetByName(CONFIG.PROMPT_SHEET_NAME);
-
-  if (!sheet) {
-    sheet = ss.insertSheet(CONFIG.PROMPT_SHEET_NAME);
-  } else {
-    sheet.clear();
-  }
-
-  ensureSheetHeaders_(sheet, PROMPT_HEADERS);
-  appendDefaultPromptRows_(sheet);
-  sheet.setFrozenRows(1);
-  sheet.autoResizeColumns(1, Math.min(PROMPT_HEADERS.length, 12));
-
-  SpreadsheetApp.getActive().toast('Лист «Промпт» пересоздан с базовыми правилами calls_v2.');
-}
-
-function appendDefaultPromptRows_(sheet) {
-  const rows = getDefaultPromptRows_().map(obj => PROMPT_HEADERS.map(h => {
-    return Object.prototype.hasOwnProperty.call(obj, h) ? obj[h] : '';
-  }));
-
-  if (rows.length > 0) {
-    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, PROMPT_HEADERS.length).setValues(rows);
-  }
-}
-
-function getDefaultPromptRows_() {
-  const promptVersion = 'calls_v2';
-  const commonScores = {
-    score_5: 'Полностью соответствует требованию, заметных улучшений не требуется.',
-    score_4: 'В целом соответствует требованию, есть небольшие недочеты без существенного влияния на звонок.',
-    score_3: 'Частично соответствует требованию, есть заметные недочеты, которые ухудшают качество коммуникации.',
-    score_2: 'Слабо соответствует требованию, ошибка существенно мешает достижению цели звонка.',
-    score_1: 'Требование фактически не выполнено или допущена грубая ошибка.'
-  };
-
-  const evidenceInstruction = 'Кратко укажи конкретное наблюдение или фрагмент разговора, на котором основана оценка. Не выдумывай цитаты.';
-  const recommendationInstruction = 'Дай короткую практическую рекомендацию оператору: что улучшить или что сохранить.';
-
-  const configs = [
-    {
-      prompt_version: promptVersion,
-      active: 'TRUE',
-      block_type: 'CONFIG',
-      rule_id: 'transcription_prompt',
-      requirement: 'Транскрибируй аудиозапись звонка на русском языке. Раздели реплики по ролям: Оператор и Клиент. Если говорящий неясен, укажи "Неизвестно". Не выдумывай текст, которого нет в аудио. Не добавляй медицинские выводы от себя.'
-    },
-    {
-      prompt_version: promptVersion,
-      active: 'TRUE',
-      block_type: 'CONFIG',
-      rule_id: 'analysis_system_prompt',
-      requirement: 'Ты анализируешь звонки операторов клиники TEMED строго по переданным evaluation_rules. Оценивай качество коммуникации, структуру разговора и безопасность формулировок. Не проверяй актуальность цен, скидок, акций, предоплат, рассрочек, расписания, коммерческих условий и корректность стоимости услуг.'
-    },
-    {
-      prompt_version: promptVersion,
-      active: 'TRUE',
-      block_type: 'CONFIG',
-      rule_id: 'output_schema',
-      requirement: 'Верни строго JSON без markdown с полями: summary, overall_score, problem_level, is_problem_call, main_strength, main_error, recommended_feedback, rule_results. Оцени звонок по каждому правилу из evaluation_rules. Для каждого правила верни результат с тем же rule_id. Не добавляй новых правил от себя. Если правило неприменимо и na_allowed = true, поставь is_na = true и score = null. Если правило применимо, поставь is_na = false и score от 1 до 5. Обязательно дай reason, evidence и recommendation. Не проверяй цены, скидки, акции, расписание и коммерческие условия.'
-    }
-  ];
-
-  const rules = [
-    makeDefaultRule_(promptVersion, 1, 'GENERAL', 'general_politeness_tone', 'Вежливость и тон общения', false, 1, 1, 2, 'Оператор должен общаться вежливо, спокойно, доброжелательно и уважительно. Не должно быть раздражения, грубости, пренебрежения, давления или сухого формального тона.'),
-    makeDefaultRule_(promptVersion, 2, 'GENERAL', 'general_active_listening', 'Активное слушание', false, 1, '', 2, 'Оператор должен слышать ответы клиента, реагировать на смысл сказанного, не перебивать без необходимости и не идти механически по скрипту.'),
-    makeDefaultRule_(promptVersion, 3, 'GENERAL', 'general_clarity', 'Ясность и понятность речи', false, 1, '', 2, 'Оператор должен говорить понятно, структурно, без лишней воды и без перегрузки клиента сложными или непонятными формулировками.'),
-    makeDefaultRule_(promptVersion, 4, 'GENERAL', 'general_conversation_control', 'Управление разговором', false, 1.5, '', 2, 'Оператор должен управлять разговором: удерживать цель звонка, задавать уместные вопросы, не терять инициативу и подводить клиента к следующему шагу.'),
-    makeDefaultRule_(promptVersion, 5, 'GENERAL', 'general_communication_safety', 'Корректность и безопасность коммуникации', false, 2, 2, 3, 'Оператор не должен ставить диагноз по телефону, давать медицинские назначения, обещать гарантированный результат, чрезмерно давить на клиента, манипулировать страхом или вводить клиента в заблуждение. Не проверять цены, скидки, акции и коммерческие условия.'),
-    makeDefaultRule_(promptVersion, 6, 'STAGE', 'stage_greeting_intro', 'Представление и начало разговора', false, 1, '', 2, 'Оператор должен корректно начать разговор: поздороваться, обозначить клинику и/или себя, а для исходящего звонка — объяснить причину звонка.'),
-    makeDefaultRule_(promptVersion, 7, 'STAGE', 'stage_need_discovery', 'Выяснение потребности', false, 2, '', 2, 'Оператор должен понять, с какой проблемой, вопросом или целью обращается клиент. Не переходить сразу к записи или цене, если потребность клиента еще не ясна.'),
-    makeDefaultRule_(promptVersion, 8, 'STAGE', 'stage_situation_clarification', 'Уточнение ситуации', true, 1.5, '', 2, 'Оператор должен уместно уточнить контекст: что беспокоит, как давно, есть ли МРТ или обследования, был ли клиент у врача, какой филиал или город удобен, насколько срочно нужно решение. Оператор не должен ставить диагноз.'),
-    makeDefaultRule_(promptVersion, 9, 'STAGE', 'stage_value_presentation', 'Презентация консультации / клиники', true, 1.5, '', 2, 'Оператор должен объяснить ценность следующего шага: консультации, приема, разбора МРТ или обращения в клинику. Презентация должна быть связана с запросом клиента, а не звучать как абстрактный скрипт.'),
-    makeDefaultRule_(promptVersion, 10, 'STAGE', 'stage_objection_handling', 'Работа с возражениями', true, 1.5, '', 2, 'Если клиент выражает сомнение, отказ, страх, недоверие, возражение по цене, времени, расстоянию или необходимости консультации, оператор должен не игнорировать это, а спокойно уточнить барьер, ответить по сути и предложить следующий шаг.', 'Если в звонке не было возражений, сомнений или барьеров со стороны клиента, поставить N/A.'),
-    makeDefaultRule_(promptVersion, 11, 'STAGE', 'stage_next_step', 'Запись или следующий шаг', false, 2, 1, 2, 'Оператор должен довести разговор до конкретного результата: записать клиента, предложить конкретное время, договориться о перезвоне, попросить прислать МРТ, объяснить следующий шаг или зафиксировать дальнейшее действие. Разговор не должен завершаться неопределенно.'),
-    makeDefaultRule_(promptVersion, 12, 'STAGE', 'stage_closing', 'Завершение разговора', false, 1, '', 2, 'Оператор должен корректно завершить разговор: подтвердить договоренность или следующий шаг, убедиться, что клиент понял дальнейшие действия, и вежливо попрощаться.')
-  ];
-
-  return configs.concat(rules.map(rule => Object.assign({}, commonScores, {
-    evidence_instruction: evidenceInstruction,
-    recommendation_instruction: recommendationInstruction
-  }, rule)));
-}
-
-function makeDefaultRule_(promptVersion, order, blockType, ruleId, ruleName, naAllowed, weight, criticalIfScoreLte, problemIfScoreLte, requirement, naCondition) {
-  return {
-    prompt_version: promptVersion,
-    active: 'TRUE',
-    block_type: blockType,
-    rule_order: order,
-    rule_id: ruleId,
-    rule_name: ruleName,
-    direction_scope: 'BOTH',
-    score_type: 'SCORE_1_5',
-    na_allowed: naAllowed ? 'TRUE' : 'FALSE',
-    weight: weight,
-    critical_if_score_lte: criticalIfScoreLte,
-    problem_if_score_lte: problemIfScoreLte,
-    requirement: requirement,
-    na_condition: naCondition || ''
-  };
-}
-
 /************************************************************
  * SCRIPT PROPERTIES
  ************************************************************/
-
-function setN8nWebhookUrl() {
-  setScriptPropertyByPrompt_(
-    CONFIG.PROP_N8N_WEBHOOK_URL,
-    'Вставь production URL webhook n8n',
-    'Например: https://n8n-x3.tech.temed.ru/webhook/mango-call-transcribe'
-  );
-}
-
-function setBitrixWebhookBaseUrl() {
-  setScriptPropertyByPrompt_(
-    CONFIG.PROP_BITRIX_WEBHOOK_BASE_URL,
-    'Вставь базовый Bitrix webhook',
-    'Например: https://temed.bitrix24.ru/rest/1/xxxxxxxxxxxx'
-  );
-}
-
-function setBitrixResponsibleId() {
-  setScriptPropertyByPrompt_(
-    CONFIG.PROP_BITRIX_RESPONSIBLE_ID,
-    'Вставь ID ответственного в Bitrix',
-    'Например: 72118'
-  );
-}
-
-function setCallbackSecret() {
-  setScriptPropertyByPrompt_(
-    CONFIG.PROP_CALLBACK_SECRET,
-    'Вставь секрет для callback из n8n',
-    'Например: temed_mango_calls_secret_2026'
-  );
-}
-
-function setCallbackWebAppUrl() {
-  setScriptPropertyByPrompt_(
-    CONFIG.PROP_CALLBACK_WEBAPP_URL,
-    'Вставь URL Web App Apps Script',
-    'После развертывания: https://script.google.com/macros/s/.../exec'
-  );
-}
-
-function showScriptProperties() {
-  const props = PropertiesService.getScriptProperties().getProperties();
-
-  const keys = [
-    CONFIG.PROP_N8N_WEBHOOK_URL,
-    CONFIG.PROP_BITRIX_WEBHOOK_BASE_URL,
-    CONFIG.PROP_BITRIX_RESPONSIBLE_ID,
-    CONFIG.PROP_CALLBACK_SECRET,
-    CONFIG.PROP_CALLBACK_WEBAPP_URL
-  ];
-
-  const text = keys.map(key => {
-    const value = props[key] || '';
-    const safeValue = key === CONFIG.PROP_CALLBACK_SECRET && value
-      ? '********'
-      : value;
-
-    return key + ' = ' + safeValue;
-  }).join('\n');
-
-  SpreadsheetApp.getUi().alert('Свойства скрипта', text || 'Свойства не заданы', SpreadsheetApp.getUi().ButtonSet.OK);
-}
-
-function setScriptPropertyByPrompt_(key, title, helpText) {
-  const ui = SpreadsheetApp.getUi();
-  const current = PropertiesService.getScriptProperties().getProperty(key) || '';
-
-  const response = ui.prompt(
-    title,
-    helpText + '\n\nТекущее значение:\n' + current,
-    ui.ButtonSet.OK_CANCEL
-  );
-
-  if (response.getSelectedButton() !== ui.Button.OK) return;
-
-  const value = String(response.getResponseText() || '').trim();
-
-  if (!value) {
-    ui.alert('Пустое значение не сохранено.');
-    return;
-  }
-
-  PropertiesService.getScriptProperties().setProperty(key, value);
-  SpreadsheetApp.getActive().toast('Сохранено: ' + key);
-}
 
 function getScriptProperty_(key) {
   return String(PropertiesService.getScriptProperties().getProperty(key) || '').trim();
@@ -429,34 +184,21 @@ function getRequiredScriptProperty_(key) {
   const value = getScriptProperty_(key);
 
   if (!value) {
-    throw new Error('Не задано свойство скрипта: ' + key);
+    throw new Error(
+      'Не задано свойство скрипта ' + key +
+      '. Укажите его вручную в Project Settings → Script properties.'
+    );
   }
 
   return value;
 }
 
 function getCallbackSecret_() {
-  let secret = getScriptProperty_(CONFIG.PROP_CALLBACK_SECRET);
-
-  if (!secret) {
-    secret = 'temed_mango_calls_secret_' + Utilities.getUuid();
-    PropertiesService.getScriptProperties().setProperty(CONFIG.PROP_CALLBACK_SECRET, secret);
-  }
-
-  return secret;
+  return getRequiredScriptProperty_(CONFIG.PROP_CALLBACK_SECRET);
 }
 
 function getCallbackWebAppUrl_() {
-  const manualUrl = getScriptProperty_(CONFIG.PROP_CALLBACK_WEBAPP_URL);
-  if (manualUrl) return manualUrl;
-
-  const serviceUrl = ScriptApp.getService().getUrl();
-  if (serviceUrl) return serviceUrl;
-
-  throw new Error(
-    'Не удалось определить URL Web App. Разверни скрипт как Web App или задай свойство ' +
-    CONFIG.PROP_CALLBACK_WEBAPP_URL
-  );
+  return getRequiredScriptProperty_(CONFIG.PROP_CALLBACK_WEBAPP_URL);
 }
 
 /************************************************************
@@ -736,40 +478,54 @@ function parseMangoSide_(mangoSide) {
  * PROMPT CONFIG
  ************************************************************/
 
+function getPromptHeaderMap_(sheet) {
+  if (sheet.getLastColumn() < 1) {
+    throw new Error(
+      'На листе "' + CONFIG.PROMPT_SHEET_NAME + '" не найдены обязательные колонки: ' +
+      PROMPT_HEADERS.join(', ') + '.'
+    );
+  }
+
+  const headerMap = getHeaderMap_(sheet);
+  const missingHeaders = PROMPT_HEADERS.filter(header => !headerMap[header]);
+
+  if (missingHeaders.length > 0) {
+    throw new Error(
+      'На листе "' + CONFIG.PROMPT_SHEET_NAME + '" не найдены обязательные колонки: ' +
+      missingHeaders.join(', ') + '.'
+    );
+  }
+
+  return headerMap;
+}
+
 function readPromptConfig_(direction) {
   const ss = SpreadsheetApp.getActive();
   const sheet = ss.getSheetByName(CONFIG.PROMPT_SHEET_NAME);
 
   if (!sheet) {
-    throw new Error('Не найден лист "' + CONFIG.PROMPT_SHEET_NAME + '". Сначала создай его через меню.');
+    throw new Error('Не найден лист "' + CONFIG.PROMPT_SHEET_NAME + '". Создайте его вручную и заполните правилами оценки.');
   }
 
-  ensureSheetHeaders_(sheet, PROMPT_HEADERS);
-
+  const headerMap = getPromptHeaderMap_(sheet);
   const lastRow = sheet.getLastRow();
 
   if (lastRow < 2) {
-    throw new Error('Лист "' + CONFIG.PROMPT_SHEET_NAME + '" пустой. Заполни правила через меню.');
+    throw new Error('На листе "Промпт" не найдено активных правил оценки.');
   }
 
-  const headerMap = getHeaderMap_(sheet);
   const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
   const normalizedDirection = String(direction || '').trim().toUpperCase();
   const configs = {};
   const rules = [];
-  let promptVersion = '';
 
   values.forEach(row => {
     const record = rowToObject_(row, headerMap);
     const blockType = String(record.block_type || '').trim().toUpperCase();
     const ruleId = String(record.rule_id || '').trim();
 
-    if (!promptVersion && record.prompt_version) {
-      promptVersion = String(record.prompt_version || '').trim();
-    }
-
     if (blockType === 'CONFIG') {
-      if (ruleId) configs[ruleId] = String(record.requirement || '');
+      if (ruleId) configs[ruleId] = String(record.requirement || '').trim();
       return;
     }
 
@@ -785,32 +541,24 @@ function readPromptConfig_(direction) {
     rules.push(normalizeEvaluationRule_(record));
   });
 
+  ['transcription_prompt', 'analysis_system_prompt', 'output_schema', 'prompt_version'].forEach(ruleId => {
+    if (!configs[ruleId]) {
+      throw new Error('На листе "Промпт" не найдена CONFIG-строка ' + ruleId + '.');
+    }
+  });
+
   rules.sort((a, b) => Number(a.rule_order || 0) - Number(b.rule_order || 0));
 
-  if (!promptVersion && rules.length > 0) promptVersion = rules[0].prompt_version;
-
-  if (!promptVersion) {
-    throw new Error('На листе "Промпт" не заполнен prompt_version.');
-  }
-
-  if (!configs.transcription_prompt) {
-    throw new Error('На листе "Промпт" нет CONFIG строки transcription_prompt.');
-  }
-
-  if (!configs.analysis_system_prompt) {
-    throw new Error('На листе "Промпт" нет CONFIG строки analysis_system_prompt.');
-  }
-
   if (rules.length === 0) {
-    throw new Error('На листе "Промпт" нет активных правил GENERAL/STAGE для направления ' + (normalizedDirection || 'BOTH') + '.');
+    throw new Error('На листе "Промпт" не найдено активных правил оценки.');
   }
 
   return {
-    prompt_version: promptVersion,
-    evaluation_rules: rules,
+    prompt_version: configs.prompt_version,
     transcription_prompt: configs.transcription_prompt,
     analysis_system_prompt: configs.analysis_system_prompt,
-    output_schema: configs.output_schema || ''
+    output_schema: configs.output_schema,
+    evaluation_rules: rules
   };
 }
 
@@ -1397,8 +1145,13 @@ function readPromptRulesForCallback_(direction) {
 
     if (!sheet || sheet.getLastRow() < 2) return result;
 
-    ensureSheetHeaders_(sheet, PROMPT_HEADERS);
-    const headerMap = getHeaderMap_(sheet);
+    let headerMap;
+
+    try {
+      headerMap = getPromptHeaderMap_(sheet);
+    } catch (headerError) {
+      return result;
+    }
     const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
     const normalizedDirection = String(direction || '').trim().toUpperCase();
 
@@ -1406,6 +1159,7 @@ function readPromptRulesForCallback_(direction) {
       const record = rowToObject_(row, headerMap);
       const blockType = String(record.block_type || '').trim().toUpperCase();
       if (['GENERAL', 'STAGE'].indexOf(blockType) === -1) return;
+      if (!isTruthy_(record.active)) return;
 
       const directionScope = String(record.direction_scope || 'BOTH').trim().toUpperCase();
       if (normalizedDirection && directionScope !== 'BOTH' && directionScope !== normalizedDirection) return;
@@ -1833,8 +1587,7 @@ function findRuleMetadataById_(ruleId) {
   const sheet = ss.getSheetByName(CONFIG.PROMPT_SHEET_NAME);
   if (!sheet || sheet.getLastRow() < 2) return null;
 
-  ensureSheetHeaders_(sheet, PROMPT_HEADERS);
-  const headerMap = getHeaderMap_(sheet);
+  const headerMap = getPromptHeaderMap_(sheet);
   const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
 
   for (let i = 0; i < values.length; i++) {

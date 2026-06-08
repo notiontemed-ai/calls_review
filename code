@@ -7,6 +7,7 @@ const CONFIG = {
 
   SHEET_NAME: 'Записи звонков',
   PROMPT_SHEET_NAME: 'Промпт',
+  EVALUATION_RESULTS_SHEET_NAME: 'Результаты оценки звонков',
 
   MAX_FILES_PER_RUN: 500,
   MAX_SEND_TO_N8N_PER_RUN: 20,
@@ -19,6 +20,51 @@ const CONFIG = {
   PROP_CALLBACK_SECRET: 'MANGO_CALLBACK_SECRET',
   PROP_CALLBACK_WEBAPP_URL: 'MANGO_CALLBACK_WEBAPP_URL'
 };
+
+const PROMPT_HEADERS = [
+  'prompt_version',
+  'active',
+  'block_type',
+  'rule_order',
+  'rule_id',
+  'rule_name',
+  'direction_scope',
+  'score_type',
+  'na_allowed',
+  'weight',
+  'critical_if_score_lte',
+  'problem_if_score_lte',
+  'requirement',
+  'score_5',
+  'score_4',
+  'score_3',
+  'score_2',
+  'score_1',
+  'na_condition',
+  'evidence_instruction',
+  'recommendation_instruction'
+];
+
+const EVALUATION_RESULT_HEADERS = [
+  'call_key',
+  'prompt_version',
+  'block_type',
+  'rule_order',
+  'rule_id',
+  'rule_name',
+  'ai_score',
+  'ai_is_na',
+  'ai_reason',
+  'ai_evidence',
+  'ai_recommendation',
+  'manual_score',
+  'manual_is_na',
+  'manual_comment',
+  'reviewer',
+  'review_status',
+  'created_at',
+  'updated_at'
+];
 
 const HEADERS = [
   'call_key',
@@ -53,6 +99,13 @@ const HEADERS = [
   'analysis_json',
   'analysis_score',
   'is_problem_call',
+  'problem_level',
+  'main_strength',
+  'main_error',
+  'recommended_feedback',
+  'manual_comment',
+  'review_date',
+  'reviewer',
 
   'bitrix_task_id',
   'bitrix_task_url',
@@ -74,6 +127,7 @@ function onOpen() {
     .addItem('Сканировать папку записей', 'scanMangoRecordingsFolder')
     .addSeparator()
     .addItem('Создать / проверить лист Промпт', 'setupPromptSheet')
+    .addItem('Пересоздать лист Промпт с базовыми правилами', 'resetPromptSheetWithDefaultRules')
     .addSeparator()
     .addItem('Отправить новые звонки в n8n', 'sendNewCallsToN8n')
     .addItem('Отправить выделенные строки в n8n', 'sendSelectedRowsToN8n')
@@ -136,34 +190,145 @@ function setupPromptSheet() {
     sheet = ss.insertSheet(CONFIG.PROMPT_SHEET_NAME);
   }
 
-  sheet.clear();
+  ensureSheetHeaders_(sheet, PROMPT_HEADERS);
 
-  const rows = [
-    ['Ключ', 'Значение'],
+  if (sheet.getLastRow() < 2 || !promptSheetHasStructuredRows_(sheet)) {
+    appendDefaultPromptRows_(sheet);
+  }
 
-    ['prompt_version', 'calls_v1'],
+  sheet.setFrozenRows(1);
+  sheet.autoResizeColumns(1, Math.min(PROMPT_HEADERS.length, 12));
 
-    [
-      'transcription_prompt',
-      'Транскрибируй аудиозапись звонка на русском языке. Раздели реплики по ролям: Оператор и Клиент. Если говорящий неясен, укажи "Неизвестно". Не выдумывай текст, которого нет в аудио. Не добавляй медицинские выводы от себя.'
-    ],
+  SpreadsheetApp.getActive().toast('Лист «Промпт» проверен. Пользовательские строки не очищались.');
+}
 
-    [
-      'analysis_prompt',
-      'Проанализируй звонок оператора продаж клиники TEMED. Оцени установление контакта, выявление потребности, объяснение ценности консультации, работу с возражениями, корректность следующего шага и качество коммуникации. Не оценивай клиническую правильность лечения. Не придумывай факты, которых нет в транскрипте.'
-    ],
+function promptSheetHasStructuredRows_(sheet) {
+  if (sheet.getLastRow() < 2) return false;
 
-    [
-      'output_schema',
-      'Верни строго JSON без markdown с полями: summary, client_request, operator_strengths, operator_errors, missed_opportunities, next_step, score_1_5, is_problem_call. score_1_5 — число от 1 до 5. is_problem_call — true или false.'
-    ]
+  const headerMap = getHeaderMap_(sheet);
+  if (!headerMap.block_type || !headerMap.rule_id) return false;
+
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+
+  return values.some(row => {
+    const blockType = String(row[headerMap.block_type - 1] || '').trim().toUpperCase();
+    const ruleId = String(row[headerMap.rule_id - 1] || '').trim();
+    return ruleId && ['CONFIG', 'GENERAL', 'STAGE'].indexOf(blockType) !== -1;
+  });
+}
+
+function resetPromptSheetWithDefaultRules() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert(
+    'Пересоздать лист «Промпт»?',
+    'Все текущие правила и настройки на листе «Промпт» будут удалены и заменены базовыми правилами calls_v2.',
+    ui.ButtonSet.YES_NO
+  );
+
+  if (response !== ui.Button.YES) return;
+
+  const ss = SpreadsheetApp.getActive();
+  let sheet = ss.getSheetByName(CONFIG.PROMPT_SHEET_NAME);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(CONFIG.PROMPT_SHEET_NAME);
+  } else {
+    sheet.clear();
+  }
+
+  ensureSheetHeaders_(sheet, PROMPT_HEADERS);
+  appendDefaultPromptRows_(sheet);
+  sheet.setFrozenRows(1);
+  sheet.autoResizeColumns(1, Math.min(PROMPT_HEADERS.length, 12));
+
+  SpreadsheetApp.getActive().toast('Лист «Промпт» пересоздан с базовыми правилами calls_v2.');
+}
+
+function appendDefaultPromptRows_(sheet) {
+  const rows = getDefaultPromptRows_().map(obj => PROMPT_HEADERS.map(h => {
+    return Object.prototype.hasOwnProperty.call(obj, h) ? obj[h] : '';
+  }));
+
+  if (rows.length > 0) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, PROMPT_HEADERS.length).setValues(rows);
+  }
+}
+
+function getDefaultPromptRows_() {
+  const promptVersion = 'calls_v2';
+  const commonScores = {
+    score_5: 'Полностью соответствует требованию, заметных улучшений не требуется.',
+    score_4: 'В целом соответствует требованию, есть небольшие недочеты без существенного влияния на звонок.',
+    score_3: 'Частично соответствует требованию, есть заметные недочеты, которые ухудшают качество коммуникации.',
+    score_2: 'Слабо соответствует требованию, ошибка существенно мешает достижению цели звонка.',
+    score_1: 'Требование фактически не выполнено или допущена грубая ошибка.'
+  };
+
+  const evidenceInstruction = 'Кратко укажи конкретное наблюдение или фрагмент разговора, на котором основана оценка. Не выдумывай цитаты.';
+  const recommendationInstruction = 'Дай короткую практическую рекомендацию оператору: что улучшить или что сохранить.';
+
+  const configs = [
+    {
+      prompt_version: promptVersion,
+      active: 'TRUE',
+      block_type: 'CONFIG',
+      rule_id: 'transcription_prompt',
+      requirement: 'Транскрибируй аудиозапись звонка на русском языке. Раздели реплики по ролям: Оператор и Клиент. Если говорящий неясен, укажи "Неизвестно". Не выдумывай текст, которого нет в аудио. Не добавляй медицинские выводы от себя.'
+    },
+    {
+      prompt_version: promptVersion,
+      active: 'TRUE',
+      block_type: 'CONFIG',
+      rule_id: 'analysis_system_prompt',
+      requirement: 'Ты анализируешь звонки операторов клиники TEMED строго по переданным evaluation_rules. Оценивай качество коммуникации, структуру разговора и безопасность формулировок. Не проверяй актуальность цен, скидок, акций, предоплат, рассрочек, расписания, коммерческих условий и корректность стоимости услуг.'
+    },
+    {
+      prompt_version: promptVersion,
+      active: 'TRUE',
+      block_type: 'CONFIG',
+      rule_id: 'output_schema',
+      requirement: 'Верни строго JSON без markdown с полями: summary, overall_score, problem_level, is_problem_call, main_strength, main_error, recommended_feedback, rule_results. Оцени звонок по каждому правилу из evaluation_rules. Для каждого правила верни результат с тем же rule_id. Не добавляй новых правил от себя. Если правило неприменимо и na_allowed = true, поставь is_na = true и score = null. Если правило применимо, поставь is_na = false и score от 1 до 5. Обязательно дай reason, evidence и recommendation. Не проверяй цены, скидки, акции, расписание и коммерческие условия.'
+    }
   ];
 
-  sheet.getRange(1, 1, rows.length, 2).setValues(rows);
-  sheet.setFrozenRows(1);
-  sheet.autoResizeColumns(1, 2);
+  const rules = [
+    makeDefaultRule_(promptVersion, 1, 'GENERAL', 'general_politeness_tone', 'Вежливость и тон общения', false, 1, 1, 2, 'Оператор должен общаться вежливо, спокойно, доброжелательно и уважительно. Не должно быть раздражения, грубости, пренебрежения, давления или сухого формального тона.'),
+    makeDefaultRule_(promptVersion, 2, 'GENERAL', 'general_active_listening', 'Активное слушание', false, 1, '', 2, 'Оператор должен слышать ответы клиента, реагировать на смысл сказанного, не перебивать без необходимости и не идти механически по скрипту.'),
+    makeDefaultRule_(promptVersion, 3, 'GENERAL', 'general_clarity', 'Ясность и понятность речи', false, 1, '', 2, 'Оператор должен говорить понятно, структурно, без лишней воды и без перегрузки клиента сложными или непонятными формулировками.'),
+    makeDefaultRule_(promptVersion, 4, 'GENERAL', 'general_conversation_control', 'Управление разговором', false, 1.5, '', 2, 'Оператор должен управлять разговором: удерживать цель звонка, задавать уместные вопросы, не терять инициативу и подводить клиента к следующему шагу.'),
+    makeDefaultRule_(promptVersion, 5, 'GENERAL', 'general_communication_safety', 'Корректность и безопасность коммуникации', false, 2, 2, 3, 'Оператор не должен ставить диагноз по телефону, давать медицинские назначения, обещать гарантированный результат, чрезмерно давить на клиента, манипулировать страхом или вводить клиента в заблуждение. Не проверять цены, скидки, акции и коммерческие условия.'),
+    makeDefaultRule_(promptVersion, 6, 'STAGE', 'stage_greeting_intro', 'Представление и начало разговора', false, 1, '', 2, 'Оператор должен корректно начать разговор: поздороваться, обозначить клинику и/или себя, а для исходящего звонка — объяснить причину звонка.'),
+    makeDefaultRule_(promptVersion, 7, 'STAGE', 'stage_need_discovery', 'Выяснение потребности', false, 2, '', 2, 'Оператор должен понять, с какой проблемой, вопросом или целью обращается клиент. Не переходить сразу к записи или цене, если потребность клиента еще не ясна.'),
+    makeDefaultRule_(promptVersion, 8, 'STAGE', 'stage_situation_clarification', 'Уточнение ситуации', true, 1.5, '', 2, 'Оператор должен уместно уточнить контекст: что беспокоит, как давно, есть ли МРТ или обследования, был ли клиент у врача, какой филиал или город удобен, насколько срочно нужно решение. Оператор не должен ставить диагноз.'),
+    makeDefaultRule_(promptVersion, 9, 'STAGE', 'stage_value_presentation', 'Презентация консультации / клиники', true, 1.5, '', 2, 'Оператор должен объяснить ценность следующего шага: консультации, приема, разбора МРТ или обращения в клинику. Презентация должна быть связана с запросом клиента, а не звучать как абстрактный скрипт.'),
+    makeDefaultRule_(promptVersion, 10, 'STAGE', 'stage_objection_handling', 'Работа с возражениями', true, 1.5, '', 2, 'Если клиент выражает сомнение, отказ, страх, недоверие, возражение по цене, времени, расстоянию или необходимости консультации, оператор должен не игнорировать это, а спокойно уточнить барьер, ответить по сути и предложить следующий шаг.', 'Если в звонке не было возражений, сомнений или барьеров со стороны клиента, поставить N/A.'),
+    makeDefaultRule_(promptVersion, 11, 'STAGE', 'stage_next_step', 'Запись или следующий шаг', false, 2, 1, 2, 'Оператор должен довести разговор до конкретного результата: записать клиента, предложить конкретное время, договориться о перезвоне, попросить прислать МРТ, объяснить следующий шаг или зафиксировать дальнейшее действие. Разговор не должен завершаться неопределенно.'),
+    makeDefaultRule_(promptVersion, 12, 'STAGE', 'stage_closing', 'Завершение разговора', false, 1, '', 2, 'Оператор должен корректно завершить разговор: подтвердить договоренность или следующий шаг, убедиться, что клиент понял дальнейшие действия, и вежливо попрощаться.')
+  ];
 
-  SpreadsheetApp.getActive().toast('Лист «Промпт» создан.');
+  return configs.concat(rules.map(rule => Object.assign({}, commonScores, {
+    evidence_instruction: evidenceInstruction,
+    recommendation_instruction: recommendationInstruction
+  }, rule)));
+}
+
+function makeDefaultRule_(promptVersion, order, blockType, ruleId, ruleName, naAllowed, weight, criticalIfScoreLte, problemIfScoreLte, requirement, naCondition) {
+  return {
+    prompt_version: promptVersion,
+    active: 'TRUE',
+    block_type: blockType,
+    rule_order: order,
+    rule_id: ruleId,
+    rule_name: ruleName,
+    direction_scope: 'BOTH',
+    score_type: 'SCORE_1_5',
+    na_allowed: naAllowed ? 'TRUE' : 'FALSE',
+    weight: weight,
+    critical_if_score_lte: criticalIfScoreLte,
+    problem_if_score_lte: problemIfScoreLte,
+    requirement: requirement,
+    na_condition: naCondition || ''
+  };
 }
 
 /************************************************************
@@ -571,7 +736,7 @@ function parseMangoSide_(mangoSide) {
  * PROMPT CONFIG
  ************************************************************/
 
-function readPromptConfig_() {
+function readPromptConfig_(direction) {
   const ss = SpreadsheetApp.getActive();
   const sheet = ss.getSheetByName(CONFIG.PROMPT_SHEET_NAME);
 
@@ -579,37 +744,115 @@ function readPromptConfig_() {
     throw new Error('Не найден лист "' + CONFIG.PROMPT_SHEET_NAME + '". Сначала создай его через меню.');
   }
 
+  ensureSheetHeaders_(sheet, PROMPT_HEADERS);
+
   const lastRow = sheet.getLastRow();
 
   if (lastRow < 2) {
-    throw new Error('Лист "' + CONFIG.PROMPT_SHEET_NAME + '" пустой.');
+    throw new Error('Лист "' + CONFIG.PROMPT_SHEET_NAME + '" пустой. Заполни правила через меню.');
   }
 
-  const values = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
-  const config = {};
+  const headerMap = getHeaderMap_(sheet);
+  const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  const normalizedDirection = String(direction || '').trim().toUpperCase();
+  const configs = {};
+  const rules = [];
+  let promptVersion = '';
 
   values.forEach(row => {
-    const key = String(row[0] || '').trim();
-    const value = String(row[1] || '').trim();
+    const record = rowToObject_(row, headerMap);
+    const blockType = String(record.block_type || '').trim().toUpperCase();
+    const ruleId = String(record.rule_id || '').trim();
 
-    if (key) {
-      config[key] = value;
+    if (!promptVersion && record.prompt_version) {
+      promptVersion = String(record.prompt_version || '').trim();
     }
+
+    if (blockType === 'CONFIG') {
+      if (ruleId) configs[ruleId] = String(record.requirement || '');
+      return;
+    }
+
+    if (['GENERAL', 'STAGE'].indexOf(blockType) === -1) return;
+    if (!isTruthy_(record.active)) return;
+
+    const directionScope = String(record.direction_scope || 'BOTH').trim().toUpperCase();
+
+    if (normalizedDirection && directionScope !== 'BOTH' && directionScope !== normalizedDirection) {
+      return;
+    }
+
+    rules.push(normalizeEvaluationRule_(record));
   });
 
-  if (!config.prompt_version) {
-    throw new Error('На листе "Промпт" не заполнен ключ prompt_version.');
+  rules.sort((a, b) => Number(a.rule_order || 0) - Number(b.rule_order || 0));
+
+  if (!promptVersion && rules.length > 0) promptVersion = rules[0].prompt_version;
+
+  if (!promptVersion) {
+    throw new Error('На листе "Промпт" не заполнен prompt_version.');
   }
 
-  if (!config.transcription_prompt) {
-    throw new Error('На листе "Промпт" не заполнен ключ transcription_prompt.');
+  if (!configs.transcription_prompt) {
+    throw new Error('На листе "Промпт" нет CONFIG строки transcription_prompt.');
   }
 
-  if (!config.analysis_prompt) {
-    throw new Error('На листе "Промпт" не заполнен ключ analysis_prompt.');
+  if (!configs.analysis_system_prompt) {
+    throw new Error('На листе "Промпт" нет CONFIG строки analysis_system_prompt.');
   }
 
-  return config;
+  if (rules.length === 0) {
+    throw new Error('На листе "Промпт" нет активных правил GENERAL/STAGE для направления ' + (normalizedDirection || 'BOTH') + '.');
+  }
+
+  return {
+    prompt_version: promptVersion,
+    evaluation_rules: rules,
+    transcription_prompt: configs.transcription_prompt,
+    analysis_system_prompt: configs.analysis_system_prompt,
+    output_schema: configs.output_schema || ''
+  };
+}
+
+function normalizeEvaluationRule_(record) {
+  return {
+    prompt_version: String(record.prompt_version || '').trim(),
+    active: isTruthy_(record.active),
+    block_type: String(record.block_type || '').trim().toUpperCase(),
+    rule_order: toNumberOrBlank_(record.rule_order),
+    rule_id: String(record.rule_id || '').trim(),
+    rule_name: String(record.rule_name || '').trim(),
+    direction_scope: String(record.direction_scope || 'BOTH').trim().toUpperCase(),
+    score_type: String(record.score_type || 'SCORE_1_5').trim().toUpperCase(),
+    na_allowed: isTruthy_(record.na_allowed),
+    weight: toNumberOrBlank_(record.weight) || 1,
+    critical_if_score_lte: toNumberOrBlank_(record.critical_if_score_lte),
+    problem_if_score_lte: toNumberOrBlank_(record.problem_if_score_lte),
+    requirement: String(record.requirement || '').trim(),
+    score_5: String(record.score_5 || '').trim(),
+    score_4: String(record.score_4 || '').trim(),
+    score_3: String(record.score_3 || '').trim(),
+    score_2: String(record.score_2 || '').trim(),
+    score_1: String(record.score_1 || '').trim(),
+    na_condition: String(record.na_condition || '').trim(),
+    evidence_instruction: String(record.evidence_instruction || '').trim(),
+    recommendation_instruction: String(record.recommendation_instruction || '').trim()
+  };
+}
+
+function readPromptRulesById_(direction) {
+  const config = readPromptConfig_(direction);
+  const map = {};
+
+  config.evaluation_rules.forEach(rule => {
+    map[rule.rule_id] = rule;
+  });
+
+  return {
+    prompt_version: config.prompt_version,
+    rules: config.evaluation_rules,
+    map: map
+  };
 }
 
 /************************************************************
@@ -621,7 +864,7 @@ function sendNewCallsToN8n() {
   ensureHeaders_(sheet);
 
   const headerMap = getHeaderMap_(sheet);
-  const promptConfig = readPromptConfig_();
+  const promptConfig = null;
 
   getRequiredScriptProperty_(CONFIG.PROP_N8N_WEBHOOK_URL);
   getCallbackSecret_();
@@ -696,7 +939,7 @@ function sendSelectedRowsToN8n() {
   }
 
   const headerMap = getHeaderMap_(sheet);
-  const promptConfig = readPromptConfig_();
+  const promptConfig = null;
 
   getRequiredScriptProperty_(CONFIG.PROP_N8N_WEBHOOK_URL);
   getCallbackSecret_();
@@ -737,6 +980,13 @@ function sendSelectedRowsToN8n() {
 }
 
 function sendRowToN8n_(sheet, rowIndex, row, headerMap, promptConfig) {
+  const directionForRules = getCellByHeader_(row, headerMap, 'direction');
+  promptConfig = readPromptConfig_(directionForRules);
+
+  if (!promptConfig.evaluation_rules || promptConfig.evaluation_rules.length === 0) {
+    throw new Error('Нет активных правил оценки для направления ' + directionForRules);
+  }
+
   const n8nWebhookUrl = getRequiredScriptProperty_(CONFIG.PROP_N8N_WEBHOOK_URL);
   const callbackSecret = getCallbackSecret_();
   const callbackUrl = getCallbackWebAppUrl_();
@@ -764,9 +1014,11 @@ function sendRowToN8n_(sheet, rowIndex, row, headerMap, promptConfig) {
     prompt_version: promptConfig.prompt_version,
 
     prompts: {
+      prompt_version: promptConfig.prompt_version,
       transcription_prompt: promptConfig.transcription_prompt,
-      analysis_prompt: promptConfig.analysis_prompt,
-      output_schema: promptConfig.output_schema || ''
+      analysis_system_prompt: promptConfig.analysis_system_prompt,
+      output_schema: promptConfig.output_schema || '',
+      evaluation_rules: promptConfig.evaluation_rules
     },
 
     callback: {
@@ -840,6 +1092,15 @@ function doPost(e) {
       });
     }
 
+    if (body.action === 'save_manual_call_review') {
+      const result = saveManualCallReview_(body);
+
+      return jsonResponse_({
+        ok: true,
+        result: result
+      });
+    }
+
     if (body.action === 'n8n_call_error') {
       const result = saveN8nCallError_(body);
 
@@ -862,12 +1123,13 @@ function doPost(e) {
   }
 }
 
-function doGet() {
-  return jsonResponse_({
-    ok: true,
-    service: 'Mango calls callback',
-    time: nowString_()
-  });
+function doGet(e) {
+  const callKey = String(e && e.parameter && e.parameter.call_key || '').trim();
+  const html = callKey ? renderCallReviewPage_(callKey) : renderAnalyzedCallsListPage_();
+
+  return HtmlService
+    .createHtmlOutput(html)
+    .setTitle(callKey ? 'Проверка звонка' : 'Последние проанализированные звонки');
 }
 
 function saveN8nCallResult_(body) {
@@ -908,6 +1170,7 @@ function saveN8nCallResult_(body) {
   );
 
   const score = String(
+    analysis.overall_score ||
     analysis.score_1_5 ||
     analysis.score ||
     body.analysis_score ||
@@ -925,6 +1188,12 @@ function saveN8nCallResult_(body) {
   setCellByHeader_(sheet, rowIndex, headerMap, 'analysis_summary', summary);
   setCellByHeader_(sheet, rowIndex, headerMap, 'analysis_score', score);
   setCellByHeader_(sheet, rowIndex, headerMap, 'is_problem_call', isProblem);
+  setCellByHeader_(sheet, rowIndex, headerMap, 'problem_level', String(analysis.problem_level || ''));
+  setCellByHeader_(sheet, rowIndex, headerMap, 'main_strength', String(analysis.main_strength || ''));
+  setCellByHeader_(sheet, rowIndex, headerMap, 'main_error', String(analysis.main_error || ''));
+  setCellByHeader_(sheet, rowIndex, headerMap, 'recommended_feedback', String(analysis.recommended_feedback || ''));
+
+  upsertEvaluationResults_(callKey, getCellByHeader_(sheet.getRange(rowIndex, 1, 1, sheet.getLastColumn()).getValues()[0], headerMap, 'direction'), analysis);
 
   setCellByHeader_(sheet, rowIndex, headerMap, 'transcript_status', transcriptText ? 'OK' : '');
   setCellByHeader_(sheet, rowIndex, headerMap, 'ai_status', analysisJson ? 'OK' : '');
@@ -970,6 +1239,328 @@ function saveN8nCallError_(body) {
     call_key: callKey,
     row: rowIndex
   };
+}
+
+
+
+/************************************************************
+ * WEB REVIEW UI
+ ************************************************************/
+
+function renderAnalyzedCallsListPage_() {
+  const sheet = getOrCreateSheet_();
+  ensureHeaders_(sheet);
+  const headerMap = getHeaderMap_(sheet);
+  const lastRow = sheet.getLastRow();
+  const callbackUrl = getCallbackWebAppUrl_();
+  const rows = [];
+
+  if (lastRow >= 2) {
+    const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+    for (let i = values.length - 1; i >= 0 && rows.length < 50; i--) {
+      const row = values[i];
+      if (getCellByHeader_(row, headerMap, 'status') === 'ANALYZED') {
+        const callKey = getCellByHeader_(row, headerMap, 'call_key');
+        rows.push('<tr><td><a href="' + htmlEscape_(callbackUrl + '?call_key=' + encodeURIComponent(callKey)) + '">' + htmlEscape_(callKey) + '</a></td><td>' + htmlEscape_(getCellByHeader_(row, headerMap, 'call_datetime')) + '</td><td>' + htmlEscape_(getCellByHeader_(row, headerMap, 'operator_name')) + '</td><td>' + htmlEscape_(getCellByHeader_(row, headerMap, 'analysis_score')) + '</td><td>' + htmlEscape_(getCellByHeader_(row, headerMap, 'problem_level')) + '</td></tr>');
+      }
+    }
+  }
+
+  return wrapReviewHtml_('Последние проанализированные звонки', '<h1>Последние проанализированные звонки</h1><table><thead><tr><th>call_key</th><th>Дата/время</th><th>Оператор</th><th>AI оценка</th><th>Уровень</th></tr></thead><tbody>' + rows.join('') + '</tbody></table>');
+}
+
+function renderCallReviewPage_(callKey) {
+  const sheet = getOrCreateSheet_();
+  ensureHeaders_(sheet);
+  const headerMap = getHeaderMap_(sheet);
+  const rowIndex = findRowByCallKey_(sheet, headerMap, callKey);
+
+  if (!rowIndex) {
+    return wrapReviewHtml_('Звонок не найден', '<h1>Звонок не найден</h1><p>call_key: ' + htmlEscape_(callKey) + '</p>');
+  }
+
+  const row = sheet.getRange(rowIndex, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const analysis = safeJsonParse_(getCellByHeader_(row, headerMap, 'analysis_json')) || {};
+  const results = loadEvaluationResultsForCall_(callKey);
+  const generalRows = results.filter(r => r.block_type === 'GENERAL');
+  const stageRows = results.filter(r => r.block_type === 'STAGE');
+  const secret = getCallbackSecret_();
+  const driveUrl = getCellByHeader_(row, headerMap, 'drive_url');
+  const driveFileId = getCellByHeader_(row, headerMap, 'drive_file_id');
+  const audioUrl = driveFileId ? 'https://drive.google.com/uc?export=download&id=' + encodeURIComponent(driveFileId) : '';
+
+  const card = [
+    '<section class="card"><h1>Проверка звонка</h1><dl class="grid">',
+    detailHtml_('Дата/время', getCellByHeader_(row, headerMap, 'call_datetime')),
+    detailHtml_('Направление', getCellByHeader_(row, headerMap, 'direction')),
+    detailHtml_('Оператор', getCellByHeader_(row, headerMap, 'operator_name')),
+    detailHtml_('Линия', getCellByHeader_(row, headerMap, 'line_name')),
+    detailHtml_('Телефон клиента', getCellByHeader_(row, headerMap, 'client_phone')),
+    detailHtml_('Статус', getCellByHeader_(row, headerMap, 'status')),
+    detailHtml_('AI оценка', getCellByHeader_(row, headerMap, 'analysis_score')),
+    detailHtml_('Уровень проблемы', getCellByHeader_(row, headerMap, 'problem_level')),
+    '</dl><p><a target="_blank" href="' + htmlEscape_(driveUrl) + '">Открыть аудио в Google Drive</a> · <a target="_blank" href="' + htmlEscape_(getCellByHeader_(row, headerMap, 'bitrix_task_url') || '#') + '">Создать задачу Bitrix</a></p>',
+    audioUrl ? '<audio controls preload="none" src="' + htmlEscape_(audioUrl) + '"></audio>' : '',
+    '</section>'
+  ].join('');
+
+  const aiBlock = '<section class="card"><h2>Итог AI</h2>' +
+    '<p><b>Краткое содержание:</b> ' + htmlEscape_(analysis.summary || getCellByHeader_(row, headerMap, 'analysis_summary')) + '</p>' +
+    '<p><b>Главная сильная сторона:</b> ' + htmlEscape_(analysis.main_strength || getCellByHeader_(row, headerMap, 'main_strength')) + '</p>' +
+    '<p><b>Главная ошибка:</b> ' + htmlEscape_(analysis.main_error || getCellByHeader_(row, headerMap, 'main_error')) + '</p>' +
+    '<p><b>Рекомендация оператору:</b> ' + htmlEscape_(analysis.recommended_feedback || getCellByHeader_(row, headerMap, 'recommended_feedback')) + '</p></section>';
+
+  const form = '<form id="reviewForm">' +
+    renderRulesTable_('Сквозные требования', 'Правило', generalRows) +
+    renderRulesTable_('Этапы разговора', 'Этап', stageRows) +
+    '<section class="card"><h2>Итоговое решение проверяющего</h2>' +
+    '<select name="review_status"><option value="AI_OK">AI верно</option><option value="HAS_QUESTIONS">Есть вопросы</option><option value="OPERATOR_GROSS_ERROR">Грубая ошибка оператора</option><option value="AI_ERROR">Ошибка AI</option></select>' +
+    '<textarea name="manual_comment" placeholder="Комментарий проверяющего">' + htmlEscape_(getCellByHeader_(row, headerMap, 'manual_comment')) + '</textarea>' +
+    '<button type="submit">Сохранить проверку</button><span id="saveStatus"></span></section></form>';
+
+  const script = '<script>const CALL_KEY=' + JSON.stringify(callKey) + ';const SECRET=' + JSON.stringify(secret) + ';' +
+    'document.getElementById("reviewForm").addEventListener("submit",async function(ev){ev.preventDefault();const rows=[...document.querySelectorAll("tr[data-rule-id]")];const rule_reviews=rows.map(r=>{const v=r.querySelector("select").value;return{rule_id:r.dataset.ruleId,manual_score:v&&v!=="N/A"?Number(v):"",manual_is_na:v==="N/A",manual_comment:r.querySelector("textarea").value};});const payload={action:"save_manual_call_review",secret:SECRET,call_key:CALL_KEY,review_status:this.review_status.value,manual_comment:this.manual_comment.value,rule_reviews:rule_reviews};const res=await fetch(location.href,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const data=await res.json();document.getElementById("saveStatus").textContent=data.ok?" Сохранено":" Ошибка: "+data.error;});</script>';
+
+  return wrapReviewHtml_('Проверка звонка', card + aiBlock + form + script);
+}
+
+function renderRulesTable_(title, firstColumnTitle, rows) {
+  const body = rows.map(r => {
+    const manualValue = isTruthy_(r.manual_is_na) ? 'N/A' : String(r.manual_score || '');
+    return '<tr data-rule-id="' + htmlEscape_(r.rule_id) + '"><td>' + htmlEscape_(r.rule_name || r.rule_id) + '</td><td>' + htmlEscape_(formatAiScore_(r.ai_score, r.ai_is_na)) + '</td><td>' + renderManualScoreSelect_(manualValue) + '</td><td>' + htmlEscape_(r.ai_reason) + '</td><td>' + htmlEscape_(r.ai_evidence) + '</td><td>' + htmlEscape_(r.ai_recommendation) + '</td><td><textarea>' + htmlEscape_(r.manual_comment) + '</textarea></td></tr>';
+  }).join('');
+
+  return '<section class="card"><h2>' + htmlEscape_(title) + '</h2><table><thead><tr><th>' + htmlEscape_(firstColumnTitle) + '</th><th>AI оценка</th><th>Ручная оценка</th><th>Обоснование AI</th><th>Фрагмент / наблюдение</th><th>Рекомендация</th><th>Комментарий проверяющего</th></tr></thead><tbody>' + body + '</tbody></table></section>';
+}
+
+function renderManualScoreSelect_(value) {
+  const options = ['', '1', '2', '3', '4', '5', 'N/A'];
+  return '<select>' + options.map(option => '<option value="' + option + '"' + (option === value ? ' selected' : '') + '>' + (option || 'пусто') + '</option>').join('') + '</select>';
+}
+
+function loadEvaluationResultsForCall_(callKey) {
+  const sheet = getOrCreateEvaluationResultsSheet_();
+  const headerMap = getHeaderMap_(sheet);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  return values.map(row => rowToObject_(row, headerMap))
+    .filter(obj => String(obj.call_key || '').trim() === callKey)
+    .sort((a, b) => Number(a.rule_order || 0) - Number(b.rule_order || 0));
+}
+
+function wrapReviewHtml_(title, body) {
+  return '<!doctype html><html><head><base target="_top"><meta charset="utf-8"><title>' + htmlEscape_(title) + '</title><style>body{font-family:Arial,sans-serif;background:#f6f7fb;margin:0;padding:24px;color:#172033}.card{background:#fff;border-radius:14px;padding:18px;margin:0 0 18px;box-shadow:0 2px 10px #0001}.grid{display:grid;grid-template-columns:180px 1fr;gap:8px 16px}dt{font-weight:700}table{width:100%;border-collapse:collapse;background:#fff}th,td{border:1px solid #dde2eb;padding:8px;vertical-align:top}th{background:#eef2f8}textarea{width:100%;min-height:64px}select,button{padding:8px}audio{width:100%;margin-top:12px}</style></head><body>' + body + '</body></html>';
+}
+
+function detailHtml_(label, value) {
+  return '<dt>' + htmlEscape_(label) + '</dt><dd>' + htmlEscape_(value || '—') + '</dd>';
+}
+
+function formatAiScore_(score, isNa) {
+  return isTruthy_(isNa) ? 'N/A' : (score || '');
+}
+
+function htmlEscape_(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/************************************************************
+ * EVALUATION RESULTS AND MANUAL REVIEW
+ ************************************************************/
+
+function getOrCreateEvaluationResultsSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sheet = ss.getSheetByName(CONFIG.EVALUATION_RESULTS_SHEET_NAME);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(CONFIG.EVALUATION_RESULTS_SHEET_NAME);
+  }
+
+  ensureSheetHeaders_(sheet, EVALUATION_RESULT_HEADERS);
+  return sheet;
+}
+
+function readPromptRulesForCallback_(direction) {
+  try {
+    return readPromptRulesById_(direction);
+  } catch (e) {
+    const ss = SpreadsheetApp.getActive();
+    const sheet = ss.getSheetByName(CONFIG.PROMPT_SHEET_NAME);
+    const result = { prompt_version: '', rules: [], map: {} };
+
+    if (!sheet || sheet.getLastRow() < 2) return result;
+
+    ensureSheetHeaders_(sheet, PROMPT_HEADERS);
+    const headerMap = getHeaderMap_(sheet);
+    const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+    const normalizedDirection = String(direction || '').trim().toUpperCase();
+
+    values.forEach(row => {
+      const record = rowToObject_(row, headerMap);
+      const blockType = String(record.block_type || '').trim().toUpperCase();
+      if (['GENERAL', 'STAGE'].indexOf(blockType) === -1) return;
+
+      const directionScope = String(record.direction_scope || 'BOTH').trim().toUpperCase();
+      if (normalizedDirection && directionScope !== 'BOTH' && directionScope !== normalizedDirection) return;
+
+      const rule = normalizeEvaluationRule_(record);
+      if (!result.prompt_version && rule.prompt_version) result.prompt_version = rule.prompt_version;
+      result.rules.push(rule);
+      result.map[rule.rule_id] = rule;
+    });
+
+    result.rules.sort((a, b) => Number(a.rule_order || 0) - Number(b.rule_order || 0));
+    return result;
+  }
+}
+
+function upsertEvaluationResults_(callKey, direction, analysis) {
+  const sheet = getOrCreateEvaluationResultsSheet_();
+  const headerMap = getHeaderMap_(sheet);
+  const promptData = readPromptRulesForCallback_(direction);
+  const now = nowString_();
+  const resultByRuleId = {};
+
+  (analysis.rule_results || []).forEach(result => {
+    const ruleId = String(result.rule_id || '').trim();
+    if (ruleId) resultByRuleId[ruleId] = result;
+  });
+
+  const ruleIds = promptData.rules.map(rule => rule.rule_id);
+  Object.keys(resultByRuleId).forEach(ruleId => {
+    if (ruleIds.indexOf(ruleId) === -1) ruleIds.push(ruleId);
+  });
+
+  ruleIds.forEach(ruleId => {
+    const rule = promptData.map[ruleId] || {
+      prompt_version: promptData.prompt_version,
+      block_type: '',
+      rule_order: '',
+      rule_id: ruleId,
+      rule_name: 'Неизвестное правило',
+      na_allowed: true
+    };
+    const aiResult = resultByRuleId[ruleId] || null;
+    let aiReason = aiResult ? String(aiResult.reason || '') : 'AI не вернул оценку по этому правилу';
+    const aiIsNa = aiResult ? normalizeBooleanForSheet_(aiResult.is_na) : '';
+
+    if (aiResult && isTruthy_(aiIsNa) && !rule.na_allowed) {
+      aiReason = '[Предупреждение: правило не допускает N/A, но AI вернул is_na = true.] ' + aiReason;
+    }
+
+    const rowIndex = findEvaluationResultRow_(sheet, headerMap, callKey, ruleId);
+    const rowObj = {
+      call_key: callKey,
+      prompt_version: rule.prompt_version || promptData.prompt_version,
+      block_type: rule.block_type || '',
+      rule_order: rule.rule_order || '',
+      rule_id: ruleId,
+      rule_name: rule.rule_name || 'Неизвестное правило',
+      ai_score: aiResult && aiResult.score !== null && aiResult.score !== undefined ? aiResult.score : '',
+      ai_is_na: aiIsNa,
+      ai_reason: aiReason,
+      ai_evidence: aiResult ? String(aiResult.evidence || '') : '',
+      ai_recommendation: aiResult ? String(aiResult.recommendation || '') : '',
+      updated_at: now
+    };
+
+    if (rowIndex) {
+      Object.keys(rowObj).forEach(key => setCellByHeader_(sheet, rowIndex, headerMap, key, rowObj[key]));
+    } else {
+      rowObj.created_at = now;
+      sheet.appendRow(EVALUATION_RESULT_HEADERS.map(h => Object.prototype.hasOwnProperty.call(rowObj, h) ? rowObj[h] : ''));
+    }
+  });
+}
+
+function saveManualCallReview_(body) {
+  const callKey = String(body.call_key || '').trim();
+  if (!callKey) throw new Error('Не передан call_key для ручной проверки');
+
+  const reviewStatus = String(body.review_status || '').trim();
+  const manualComment = String(body.manual_comment || '').trim();
+  const reviewer = getReviewerEmail_();
+  const now = nowString_();
+
+  const resultsSheet = getOrCreateEvaluationResultsSheet_();
+  const resultsHeaderMap = getHeaderMap_(resultsSheet);
+  const reviews = body.rule_reviews || [];
+
+  reviews.forEach(review => {
+    const ruleId = String(review.rule_id || '').trim();
+    if (!ruleId) return;
+
+    let rowIndex = findEvaluationResultRow_(resultsSheet, resultsHeaderMap, callKey, ruleId);
+
+    if (!rowIndex) {
+      resultsSheet.appendRow(EVALUATION_RESULT_HEADERS.map(h => {
+        if (h === 'call_key') return callKey;
+        if (h === 'rule_id') return ruleId;
+        if (h === 'rule_name') return 'Неизвестное правило';
+        if (h === 'created_at' || h === 'updated_at') return now;
+        return '';
+      }));
+      rowIndex = resultsSheet.getLastRow();
+    }
+
+    setCellByHeader_(resultsSheet, rowIndex, resultsHeaderMap, 'manual_score', review.manual_score === null || review.manual_score === undefined ? '' : review.manual_score);
+    setCellByHeader_(resultsSheet, rowIndex, resultsHeaderMap, 'manual_is_na', normalizeBooleanForSheet_(review.manual_is_na));
+    setCellByHeader_(resultsSheet, rowIndex, resultsHeaderMap, 'manual_comment', String(review.manual_comment || ''));
+    setCellByHeader_(resultsSheet, rowIndex, resultsHeaderMap, 'reviewer', reviewer);
+    setCellByHeader_(resultsSheet, rowIndex, resultsHeaderMap, 'review_status', reviewStatus);
+    setCellByHeader_(resultsSheet, rowIndex, resultsHeaderMap, 'updated_at', now);
+  });
+
+  const callsSheet = getOrCreateSheet_();
+  ensureHeaders_(callsSheet);
+  const callsHeaderMap = getHeaderMap_(callsSheet);
+  const callRow = findRowByCallKey_(callsSheet, callsHeaderMap, callKey);
+
+  if (callRow) {
+    setCellByHeader_(callsSheet, callRow, callsHeaderMap, 'review_status', reviewStatus);
+    setCellByHeader_(callsSheet, callRow, callsHeaderMap, 'manual_comment', manualComment);
+    setCellByHeader_(callsSheet, callRow, callsHeaderMap, 'review_date', now);
+    setCellByHeader_(callsSheet, callRow, callsHeaderMap, 'reviewer', reviewer);
+    setCellByHeader_(callsSheet, callRow, callsHeaderMap, 'updated_at', now);
+  }
+
+  return {
+    call_key: callKey,
+    saved_rules: reviews.length
+  };
+}
+
+function findEvaluationResultRow_(sheet, headerMap, callKey, ruleId) {
+  const callKeyCol = headerMap.call_key;
+  const ruleIdCol = headerMap.rule_id;
+  if (!callKeyCol || !ruleIdCol) return null;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  for (let i = 0; i < values.length; i++) {
+    if (String(values[i][callKeyCol - 1] || '').trim() === callKey && String(values[i][ruleIdCol - 1] || '').trim() === ruleId) {
+      return i + 2;
+    }
+  }
+
+  return null;
+}
+
+function getReviewerEmail_() {
+  try {
+    return String(Session.getActiveUser().getEmail() || '').trim();
+  } catch (e) {
+    return '';
+  }
 }
 
 /************************************************************
@@ -1099,6 +1690,11 @@ function createBitrixTaskForRow_(sheet, rowIndex, row, headerMap) {
   const analysisScore = getCellByHeader_(row, headerMap, 'analysis_score');
   const analysisJson = getCellByHeader_(row, headerMap, 'analysis_json');
   const transcriptText = getCellByHeader_(row, headerMap, 'transcript_text');
+  const problemLevel = getCellByHeader_(row, headerMap, 'problem_level');
+  const mainError = getCellByHeader_(row, headerMap, 'main_error');
+  const recommendedFeedback = getCellByHeader_(row, headerMap, 'recommended_feedback');
+  const reviewUrl = buildCallReviewUrl_(callKey);
+  const problematicRulesText = buildProblematicRulesText_(callKey, analysisJson);
 
   const title = 'Проверить проблемный звонок: ' + callDateTime + ' / ' + clientPhone;
 
@@ -1107,20 +1703,24 @@ function createBitrixTaskForRow_(sheet, rowIndex, row, headerMap) {
     '',
     'Дата/время: ' + callDateTime,
     'Направление: ' + direction,
-    'Клиентский телефон: ' + clientPhone,
-    'Наша сторона: ' + mangoSide,
     'Оператор: ' + operatorName,
+    'Телефон клиента: ' + clientPhone,
+    'Линия: ' + mangoSide,
     '',
     'Аудиозапись:',
     driveUrl,
     '',
-    'Оценка AI: ' + analysisScore,
+    'AI-оценка: ' + analysisScore,
+    'Уровень проблемы: ' + problemLevel,
+    'Краткое содержание: ' + (analysisSummary || '—'),
+    'Главная ошибка: ' + (mainError || '—'),
+    'Рекомендация оператору: ' + (recommendedFeedback || '—'),
     '',
-    'Краткое резюме:',
-    analysisSummary || '—',
+    'Ссылка на страницу проверки:',
+    reviewUrl || '—',
     '',
-    'JSON анализа:',
-    truncateText_(analysisJson || '—', 4000),
+    'Проблемные правила:',
+    problematicRulesText || '—',
     '',
     'Транскрипт:',
     truncateText_(transcriptText || '—', 4000),
@@ -1189,6 +1789,64 @@ function createBitrixTaskForRow_(sheet, rowIndex, row, headerMap) {
   };
 }
 
+function buildCallReviewUrl_(callKey) {
+  try {
+    return getCallbackWebAppUrl_() + '?call_key=' + encodeURIComponent(callKey);
+  } catch (e) {
+    return '';
+  }
+}
+
+function buildProblematicRulesText_(callKey, analysisJson) {
+  const analysis = safeJsonParse_(analysisJson) || {};
+  const results = loadEvaluationResultsForCall_(callKey);
+  const lines = [];
+
+  results.forEach(result => {
+    const score = toNumberOrBlank_(result.ai_score);
+    if (score === '') return;
+
+    const ruleMeta = findRuleMetadataById_(result.rule_id);
+    const critical = ruleMeta ? toNumberOrBlank_(ruleMeta.critical_if_score_lte) : '';
+    const problem = ruleMeta ? toNumberOrBlank_(ruleMeta.problem_if_score_lte) : '';
+    const isProblemRule = (critical !== '' && score <= critical) || (problem !== '' && score <= problem);
+
+    if (!isProblemRule) return;
+
+    lines.push([
+      'Правило: ' + (result.rule_name || result.rule_id),
+      'Оценка: ' + score,
+      'Почему: ' + (result.ai_reason || '—'),
+      'Рекомендация: ' + (result.ai_recommendation || '—')
+    ].join('\n'));
+  });
+
+  if (lines.length === 0 && analysis.rule_results) {
+    return '';
+  }
+
+  return lines.join('\n\n');
+}
+
+function findRuleMetadataById_(ruleId) {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(CONFIG.PROMPT_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) return null;
+
+  ensureSheetHeaders_(sheet, PROMPT_HEADERS);
+  const headerMap = getHeaderMap_(sheet);
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+
+  for (let i = 0; i < values.length; i++) {
+    const record = rowToObject_(values[i], headerMap);
+    if (String(record.rule_id || '').trim() === ruleId) {
+      return normalizeEvaluationRule_(record);
+    }
+  }
+
+  return null;
+}
+
 function normalizeBitrixWebhookBase_(url) {
   return String(url || '').trim().replace(/\/+$/, '');
 }
@@ -1242,6 +1900,41 @@ function ensureHeaders_(sheet) {
   }
 
   const missing = HEADERS.filter(h => existingHeaders.indexOf(h) === -1);
+
+  if (missing.length > 0) {
+    sheet
+      .getRange(1, existingHeaders.length + 1, 1, missing.length)
+      .setValues([missing]);
+  }
+
+  sheet.setFrozenRows(1);
+}
+
+function ensureSheetHeaders_(sheet, headers) {
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+
+  if (lastRow === 0 || lastColumn === 0) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+    return;
+  }
+
+  const firstRow = sheet
+    .getRange(1, 1, 1, Math.max(lastColumn, headers.length))
+    .getValues()[0]
+    .map(String)
+    .map(s => s.trim());
+
+  const existingHeaders = firstRow.filter(Boolean);
+
+  if (existingHeaders.length === 0) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+    return;
+  }
+
+  const missing = headers.filter(h => existingHeaders.indexOf(h) === -1);
 
   if (missing.length > 0) {
     sheet
@@ -1332,6 +2025,22 @@ function findRowByCallKey_(sheet, headerMap, callKey) {
   }
 
   return null;
+}
+
+function rowToObject_(row, headerMap) {
+  const obj = {};
+
+  Object.keys(headerMap).forEach(header => {
+    obj[header] = row[headerMap[header] - 1];
+  });
+
+  return obj;
+}
+
+function toNumberOrBlank_(value) {
+  if (value === '' || value === null || value === undefined) return '';
+  const n = Number(String(value).replace(',', '.'));
+  return isNaN(n) ? '' : n;
 }
 
 /************************************************************

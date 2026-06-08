@@ -1,0 +1,1523 @@
+/************************************************************
+ * MANGO CALLS → GOOGLE SHEETS → N8N → BITRIX
+ ************************************************************/
+
+const CONFIG = {
+  SOURCE_FOLDER_ID: '18SGE3iAAW7sTo3jeyicgbLGXVxOOdSdy',
+
+  SHEET_NAME: 'Записи звонков',
+  PROMPT_SHEET_NAME: 'Промпт',
+
+  MAX_FILES_PER_RUN: 500,
+  MAX_SEND_TO_N8N_PER_RUN: 20,
+
+  RENAME_FILES_ON_DRIVE: true,
+
+  PROP_N8N_WEBHOOK_URL: 'MANGO_N8N_WEBHOOK_URL',
+  PROP_BITRIX_WEBHOOK_BASE_URL: 'MANGO_BITRIX_WEBHOOK_BASE_URL',
+  PROP_BITRIX_RESPONSIBLE_ID: 'MANGO_BITRIX_RESPONSIBLE_ID',
+  PROP_CALLBACK_SECRET: 'MANGO_CALLBACK_SECRET',
+  PROP_CALLBACK_WEBAPP_URL: 'MANGO_CALLBACK_WEBAPP_URL'
+};
+
+const HEADERS = [
+  'call_key',
+  'filename_raw',
+  'filename_fixed',
+
+  'call_datetime',
+  'call_date',
+  'call_time',
+
+  'direction',
+  'client_phone',
+  'mango_side',
+  'line_name',
+  'operator_name',
+
+  'drive_file_id',
+  'drive_url',
+
+  'status',
+  'transcript_status',
+  'ai_status',
+  'review_status',
+
+  'n8n_status',
+  'n8n_sent_at',
+  'n8n_result_at',
+
+  'prompt_version',
+  'transcript_text',
+  'analysis_summary',
+  'analysis_json',
+  'analysis_score',
+  'is_problem_call',
+
+  'bitrix_task_id',
+  'bitrix_task_url',
+
+  'error_text',
+  'created_at',
+  'updated_at'
+];
+
+/************************************************************
+ * MENU
+ ************************************************************/
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Mango записи')
+    .addItem('Создать / проверить лист записей', 'setupMangoCallsSheet')
+    .addItem('Пересоздать лист записей', 'resetMangoCallsSheet')
+    .addItem('Сканировать папку записей', 'scanMangoRecordingsFolder')
+    .addSeparator()
+    .addItem('Создать / проверить лист Промпт', 'setupPromptSheet')
+    .addSeparator()
+    .addItem('Отправить новые звонки в n8n', 'sendNewCallsToN8n')
+    .addItem('Отправить выделенные строки в n8n', 'sendSelectedRowsToN8n')
+    .addSeparator()
+    .addItem('Создать задачи Bitrix по проблемным звонкам', 'createBitrixTasksForProblemCalls')
+    .addItem('Создать задачи Bitrix по выделенным строкам', 'createBitrixTasksForSelectedRows')
+    .addSeparator()
+    .addItem('Настройки: задать n8n webhook', 'setN8nWebhookUrl')
+    .addItem('Настройки: задать Bitrix webhook', 'setBitrixWebhookBaseUrl')
+    .addItem('Настройки: задать ответственного Bitrix', 'setBitrixResponsibleId')
+    .addItem('Настройки: задать callback secret', 'setCallbackSecret')
+    .addItem('Настройки: задать URL Web App callback', 'setCallbackWebAppUrl')
+    .addItem('Настройки: показать свойства', 'showScriptProperties')
+    .addSeparator()
+    .addItem('Тест: исправить имя из выделенной ячейки', 'testFixSelectedCell')
+    .addToUi();
+}
+
+/************************************************************
+ * SETUP SHEETS
+ ************************************************************/
+
+function setupMangoCallsSheet() {
+  const sheet = getOrCreateSheet_();
+  ensureHeaders_(sheet);
+  SpreadsheetApp.getActive().toast('Лист проверен: ' + CONFIG.SHEET_NAME);
+}
+
+function resetMangoCallsSheet() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert(
+    'Пересоздать лист?',
+    'Лист "' + CONFIG.SHEET_NAME + '" будет полностью очищен и создан заново.',
+    ui.ButtonSet.YES_NO
+  );
+
+  if (response !== ui.Button.YES) return;
+
+  const ss = SpreadsheetApp.getActive();
+  let sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(CONFIG.SHEET_NAME);
+  } else {
+    sheet.clear();
+  }
+
+  sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
+  sheet.setFrozenRows(1);
+  sheet.autoResizeColumns(1, Math.min(HEADERS.length, 12));
+
+  SpreadsheetApp.getActive().toast('Лист пересоздан.');
+}
+
+function setupPromptSheet() {
+  const ss = SpreadsheetApp.getActive();
+  let sheet = ss.getSheetByName(CONFIG.PROMPT_SHEET_NAME);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(CONFIG.PROMPT_SHEET_NAME);
+  }
+
+  sheet.clear();
+
+  const rows = [
+    ['Ключ', 'Значение'],
+
+    ['prompt_version', 'calls_v1'],
+
+    [
+      'transcription_prompt',
+      'Транскрибируй аудиозапись звонка на русском языке. Раздели реплики по ролям: Оператор и Клиент. Если говорящий неясен, укажи "Неизвестно". Не выдумывай текст, которого нет в аудио. Не добавляй медицинские выводы от себя.'
+    ],
+
+    [
+      'analysis_prompt',
+      'Проанализируй звонок оператора продаж клиники TEMED. Оцени установление контакта, выявление потребности, объяснение ценности консультации, работу с возражениями, корректность следующего шага и качество коммуникации. Не оценивай клиническую правильность лечения. Не придумывай факты, которых нет в транскрипте.'
+    ],
+
+    [
+      'output_schema',
+      'Верни строго JSON без markdown с полями: summary, client_request, operator_strengths, operator_errors, missed_opportunities, next_step, score_1_5, is_problem_call. score_1_5 — число от 1 до 5. is_problem_call — true или false.'
+    ]
+  ];
+
+  sheet.getRange(1, 1, rows.length, 2).setValues(rows);
+  sheet.setFrozenRows(1);
+  sheet.autoResizeColumns(1, 2);
+
+  SpreadsheetApp.getActive().toast('Лист «Промпт» создан.');
+}
+
+/************************************************************
+ * SCRIPT PROPERTIES
+ ************************************************************/
+
+function setN8nWebhookUrl() {
+  setScriptPropertyByPrompt_(
+    CONFIG.PROP_N8N_WEBHOOK_URL,
+    'Вставь production URL webhook n8n',
+    'Например: https://n8n-x3.tech.temed.ru/webhook/mango-call-transcribe'
+  );
+}
+
+function setBitrixWebhookBaseUrl() {
+  setScriptPropertyByPrompt_(
+    CONFIG.PROP_BITRIX_WEBHOOK_BASE_URL,
+    'Вставь базовый Bitrix webhook',
+    'Например: https://temed.bitrix24.ru/rest/1/xxxxxxxxxxxx'
+  );
+}
+
+function setBitrixResponsibleId() {
+  setScriptPropertyByPrompt_(
+    CONFIG.PROP_BITRIX_RESPONSIBLE_ID,
+    'Вставь ID ответственного в Bitrix',
+    'Например: 72118'
+  );
+}
+
+function setCallbackSecret() {
+  setScriptPropertyByPrompt_(
+    CONFIG.PROP_CALLBACK_SECRET,
+    'Вставь секрет для callback из n8n',
+    'Например: temed_mango_calls_secret_2026'
+  );
+}
+
+function setCallbackWebAppUrl() {
+  setScriptPropertyByPrompt_(
+    CONFIG.PROP_CALLBACK_WEBAPP_URL,
+    'Вставь URL Web App Apps Script',
+    'После развертывания: https://script.google.com/macros/s/.../exec'
+  );
+}
+
+function showScriptProperties() {
+  const props = PropertiesService.getScriptProperties().getProperties();
+
+  const keys = [
+    CONFIG.PROP_N8N_WEBHOOK_URL,
+    CONFIG.PROP_BITRIX_WEBHOOK_BASE_URL,
+    CONFIG.PROP_BITRIX_RESPONSIBLE_ID,
+    CONFIG.PROP_CALLBACK_SECRET,
+    CONFIG.PROP_CALLBACK_WEBAPP_URL
+  ];
+
+  const text = keys.map(key => {
+    const value = props[key] || '';
+    const safeValue = key === CONFIG.PROP_CALLBACK_SECRET && value
+      ? '********'
+      : value;
+
+    return key + ' = ' + safeValue;
+  }).join('\n');
+
+  SpreadsheetApp.getUi().alert('Свойства скрипта', text || 'Свойства не заданы', SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+function setScriptPropertyByPrompt_(key, title, helpText) {
+  const ui = SpreadsheetApp.getUi();
+  const current = PropertiesService.getScriptProperties().getProperty(key) || '';
+
+  const response = ui.prompt(
+    title,
+    helpText + '\n\nТекущее значение:\n' + current,
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  const value = String(response.getResponseText() || '').trim();
+
+  if (!value) {
+    ui.alert('Пустое значение не сохранено.');
+    return;
+  }
+
+  PropertiesService.getScriptProperties().setProperty(key, value);
+  SpreadsheetApp.getActive().toast('Сохранено: ' + key);
+}
+
+function getScriptProperty_(key) {
+  return String(PropertiesService.getScriptProperties().getProperty(key) || '').trim();
+}
+
+function getRequiredScriptProperty_(key) {
+  const value = getScriptProperty_(key);
+
+  if (!value) {
+    throw new Error('Не задано свойство скрипта: ' + key);
+  }
+
+  return value;
+}
+
+function getCallbackSecret_() {
+  let secret = getScriptProperty_(CONFIG.PROP_CALLBACK_SECRET);
+
+  if (!secret) {
+    secret = 'temed_mango_calls_secret_' + Utilities.getUuid();
+    PropertiesService.getScriptProperties().setProperty(CONFIG.PROP_CALLBACK_SECRET, secret);
+  }
+
+  return secret;
+}
+
+function getCallbackWebAppUrl_() {
+  const manualUrl = getScriptProperty_(CONFIG.PROP_CALLBACK_WEBAPP_URL);
+  if (manualUrl) return manualUrl;
+
+  const serviceUrl = ScriptApp.getService().getUrl();
+  if (serviceUrl) return serviceUrl;
+
+  throw new Error(
+    'Не удалось определить URL Web App. Разверни скрипт как Web App или задай свойство ' +
+    CONFIG.PROP_CALLBACK_WEBAPP_URL
+  );
+}
+
+/************************************************************
+ * SCAN GOOGLE DRIVE
+ ************************************************************/
+
+function scanMangoRecordingsFolder() {
+  const sheet = getOrCreateSheet_();
+  ensureHeaders_(sheet);
+
+  const headerMap = getHeaderMap_(sheet);
+  const existingCallKeys = loadExistingCallKeys_(sheet, headerMap);
+
+  const folder = DriveApp.getFolderById(CONFIG.SOURCE_FOLDER_ID);
+  const files = folder.getFiles();
+
+  let processed = 0;
+  let added = 0;
+  let skippedDuplicates = 0;
+  let renamed = 0;
+  let skippedNotMp3 = 0;
+  let errors = 0;
+
+  const rowsToAppend = [];
+
+  while (files.hasNext() && processed < CONFIG.MAX_FILES_PER_RUN) {
+    const file = files.next();
+    processed++;
+
+    try {
+      const filenameRaw = file.getName();
+
+      if (!isMp3_(filenameRaw)) {
+        skippedNotMp3++;
+        continue;
+      }
+
+      const filenameFixed = normalizeMangoFilename_(filenameRaw);
+      const callKey = buildCallKey_(filenameFixed);
+
+      if (!callKey) {
+        errors++;
+        continue;
+      }
+
+      if (existingCallKeys.has(callKey)) {
+        skippedDuplicates++;
+
+        if (CONFIG.RENAME_FILES_ON_DRIVE && filenameFixed !== filenameRaw) {
+          file.setName(filenameFixed);
+          renamed++;
+        }
+
+        continue;
+      }
+
+      if (CONFIG.RENAME_FILES_ON_DRIVE && filenameFixed !== filenameRaw) {
+        file.setName(filenameFixed);
+        renamed++;
+      }
+
+      const parsed = parseMangoFilename_(filenameFixed);
+      const now = nowString_();
+
+      const rowObj = {
+        call_key: callKey,
+        filename_raw: filenameRaw,
+        filename_fixed: filenameFixed,
+
+        call_datetime: parsed.call_datetime,
+        call_date: parsed.call_date,
+        call_time: parsed.call_time,
+
+        direction: parsed.direction,
+        client_phone: parsed.client_phone,
+        mango_side: parsed.mango_side,
+        line_name: parsed.line_name,
+        operator_name: parsed.operator_name,
+
+        drive_file_id: file.getId(),
+        drive_url: file.getUrl(),
+
+        status: parsed.error_text ? 'ERROR' : 'NEW',
+        transcript_status: '',
+        ai_status: '',
+        review_status: '',
+
+        n8n_status: '',
+        n8n_sent_at: '',
+        n8n_result_at: '',
+
+        prompt_version: '',
+        transcript_text: '',
+        analysis_summary: '',
+        analysis_json: '',
+        analysis_score: '',
+        is_problem_call: '',
+
+        bitrix_task_id: '',
+        bitrix_task_url: '',
+
+        error_text: parsed.error_text,
+        created_at: now,
+        updated_at: now
+      };
+
+      rowsToAppend.push(makeRowByHeaders_(rowObj));
+      existingCallKeys.add(callKey);
+      added++;
+
+    } catch (e) {
+      errors++;
+      Logger.log('Ошибка обработки файла: ' + e.stack);
+    }
+  }
+
+  if (rowsToAppend.length > 0) {
+    sheet
+      .getRange(sheet.getLastRow() + 1, 1, rowsToAppend.length, HEADERS.length)
+      .setValues(rowsToAppend);
+  }
+
+  const message =
+    'Готово. Обработано: ' + processed +
+    ', добавлено: ' + added +
+    ', дублей пропущено: ' + skippedDuplicates +
+    ', переименовано: ' + renamed +
+    ', не mp3: ' + skippedNotMp3 +
+    ', ошибок: ' + errors;
+
+  SpreadsheetApp.getActive().toast(message);
+  Logger.log(message);
+}
+
+/************************************************************
+ * PARSE MANGO FILENAME
+ ************************************************************/
+
+function normalizeMangoFilename_(filename) {
+  const original = String(filename || '').normalize('NFC');
+  const decoded = decodeMacCyrillicAsCp866_(original);
+
+  if (shouldUseDecodedName_(original, decoded)) {
+    return sanitizeDriveFilename_(decoded);
+  }
+
+  return sanitizeDriveFilename_(original);
+}
+
+function buildCallKey_(filenameFixed) {
+  const base = stripExtension_(filenameFixed).trim();
+
+  if (!base) return '';
+
+  return base
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Форматы:
+ *
+ * OUTBOUND / мы звоним:
+ * 2026-06-05__10-27-54__Продажи 2 Шкляр А__79378511104.mp3
+ *
+ * INBOUND / нам звонят:
+ * 2026-06-05__10-40-03__79203381996__Продажи 4 Солопова О.mp3
+ */
+function parseMangoFilename_(filenameFixed) {
+  const base = stripExtension_(filenameFixed);
+  const parts = base.split('__').map(p => String(p || '').trim());
+
+  const result = {
+    call_datetime: '',
+    call_date: '',
+    call_time: '',
+
+    direction: '',
+    client_phone: '',
+    mango_side: '',
+    line_name: '',
+    operator_name: '',
+
+    error_text: ''
+  };
+
+  if (parts.length < 4) {
+    result.error_text = 'Не удалось разобрать имя файла: ожидается минимум 4 блока через "__"';
+    return result;
+  }
+
+  const datePart = parts[0];
+  const timePartRaw = parts[1];
+  const timePart = timePartRaw.replace(/-/g, ':');
+
+  result.call_date = datePart;
+  result.call_time = timePart;
+  result.call_datetime = datePart + ' ' + timePart;
+
+  const payloadParts = parts.slice(2);
+
+  const firstPayload = payloadParts[0];
+  const lastPayload = payloadParts[payloadParts.length - 1];
+
+  const firstIsPhone = isPhone_(firstPayload);
+  const lastIsPhone = isPhone_(lastPayload);
+
+  if (firstIsPhone && !lastIsPhone) {
+    result.direction = 'INBOUND';
+    result.client_phone = firstPayload;
+    result.mango_side = payloadParts.slice(1).join('__').trim();
+
+  } else if (!firstIsPhone && lastIsPhone) {
+    result.direction = 'OUTBOUND';
+    result.client_phone = lastPayload;
+    result.mango_side = payloadParts.slice(0, payloadParts.length - 1).join('__').trim();
+
+  } else if (firstIsPhone && lastIsPhone) {
+    result.error_text = 'Неоднозначное имя файла: телефон найден и в начале, и в конце блока после времени';
+    return result;
+
+  } else {
+    result.error_text = 'Не найден телефон клиента ни в начале, ни в конце блока после времени';
+    return result;
+  }
+
+  const sideParsed = parseMangoSide_(result.mango_side);
+
+  result.line_name = sideParsed.line_name;
+  result.operator_name = sideParsed.operator_name;
+
+  const problems = [];
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) {
+    problems.push('Некорректная дата: ' + datePart);
+  }
+
+  if (!/^\d{2}:\d{2}:\d{2}$/.test(timePart)) {
+    problems.push('Некорректное время: ' + timePartRaw);
+  }
+
+  if (!result.client_phone || !isPhone_(result.client_phone)) {
+    problems.push('Некорректный телефон клиента: ' + result.client_phone);
+  }
+
+  if (!result.mango_side) {
+    problems.push('Не определена наша сторона звонка');
+  }
+
+  if (!result.direction) {
+    problems.push('Не определено направление звонка');
+  }
+
+  result.error_text = problems.join('; ');
+
+  return result;
+}
+
+function parseMangoSide_(mangoSide) {
+  const text = String(mangoSide || '').trim();
+  const tokens = text.split(/\s+/).filter(Boolean);
+
+  const result = {
+    line_name: text,
+    operator_name: ''
+  };
+
+  if (tokens.length >= 3) {
+    result.operator_name = tokens.slice(-2).join(' ');
+    result.line_name = tokens.slice(0, -2).join(' ');
+  }
+
+  return result;
+}
+
+/************************************************************
+ * PROMPT CONFIG
+ ************************************************************/
+
+function readPromptConfig_() {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(CONFIG.PROMPT_SHEET_NAME);
+
+  if (!sheet) {
+    throw new Error('Не найден лист "' + CONFIG.PROMPT_SHEET_NAME + '". Сначала создай его через меню.');
+  }
+
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) {
+    throw new Error('Лист "' + CONFIG.PROMPT_SHEET_NAME + '" пустой.');
+  }
+
+  const values = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
+  const config = {};
+
+  values.forEach(row => {
+    const key = String(row[0] || '').trim();
+    const value = String(row[1] || '').trim();
+
+    if (key) {
+      config[key] = value;
+    }
+  });
+
+  if (!config.prompt_version) {
+    throw new Error('На листе "Промпт" не заполнен ключ prompt_version.');
+  }
+
+  if (!config.transcription_prompt) {
+    throw new Error('На листе "Промпт" не заполнен ключ transcription_prompt.');
+  }
+
+  if (!config.analysis_prompt) {
+    throw new Error('На листе "Промпт" не заполнен ключ analysis_prompt.');
+  }
+
+  return config;
+}
+
+/************************************************************
+ * SEND TO N8N
+ ************************************************************/
+
+function sendNewCallsToN8n() {
+  const sheet = getOrCreateSheet_();
+  ensureHeaders_(sheet);
+
+  const headerMap = getHeaderMap_(sheet);
+  const promptConfig = readPromptConfig_();
+
+  getRequiredScriptProperty_(CONFIG.PROP_N8N_WEBHOOK_URL);
+  getCallbackSecret_();
+  getCallbackWebAppUrl_();
+
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) {
+    SpreadsheetApp.getActive().toast('Нет строк для отправки.');
+    return;
+  }
+
+  const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+
+  let sent = 0;
+  let skipped = 0;
+  let errors = 0;
+
+  for (let i = 0; i < values.length; i++) {
+    if (sent >= CONFIG.MAX_SEND_TO_N8N_PER_RUN) break;
+
+    const rowIndex = i + 2;
+    const row = values[i];
+
+    const status = getCellByHeader_(row, headerMap, 'status');
+    const n8nStatus = getCellByHeader_(row, headerMap, 'n8n_status');
+    const errorText = getCellByHeader_(row, headerMap, 'error_text');
+
+    if (errorText) {
+      skipped++;
+      continue;
+    }
+
+    if (status !== 'NEW') {
+      skipped++;
+      continue;
+    }
+
+    if (n8nStatus === 'SENT_TO_N8N' || n8nStatus === 'ANALYZED') {
+      skipped++;
+      continue;
+    }
+
+    try {
+      sendRowToN8n_(sheet, rowIndex, row, headerMap, promptConfig);
+      sent++;
+    } catch (e) {
+      errors++;
+      setCellByHeader_(sheet, rowIndex, headerMap, 'n8n_status', 'N8N_ERROR');
+      setCellByHeader_(sheet, rowIndex, headerMap, 'status', 'N8N_ERROR');
+      setCellByHeader_(sheet, rowIndex, headerMap, 'error_text', String(e.message || e));
+      setCellByHeader_(sheet, rowIndex, headerMap, 'updated_at', nowString_());
+    }
+  }
+
+  SpreadsheetApp.getActive().toast(
+    'Отправка в n8n завершена. Отправлено: ' + sent +
+    ', пропущено: ' + skipped +
+    ', ошибок: ' + errors
+  );
+}
+
+function sendSelectedRowsToN8n() {
+  const sheet = getOrCreateSheet_();
+  ensureHeaders_(sheet);
+
+  const range = SpreadsheetApp.getActiveRange();
+
+  if (!range) {
+    SpreadsheetApp.getUi().alert('Выдели строки, которые нужно отправить в n8n.');
+    return;
+  }
+
+  const headerMap = getHeaderMap_(sheet);
+  const promptConfig = readPromptConfig_();
+
+  getRequiredScriptProperty_(CONFIG.PROP_N8N_WEBHOOK_URL);
+  getCallbackSecret_();
+  getCallbackWebAppUrl_();
+
+  const startRow = range.getRow();
+  const numRows = range.getNumRows();
+
+  let sent = 0;
+  let errors = 0;
+
+  for (let r = startRow; r < startRow + numRows; r++) {
+    if (r === 1) continue;
+
+    const row = sheet.getRange(r, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+    try {
+      const errorText = getCellByHeader_(row, headerMap, 'error_text');
+
+      if (errorText) {
+        throw new Error('Строка содержит ошибку парсинга: ' + errorText);
+      }
+
+      sendRowToN8n_(sheet, r, row, headerMap, promptConfig);
+      sent++;
+    } catch (e) {
+      errors++;
+      setCellByHeader_(sheet, r, headerMap, 'n8n_status', 'N8N_ERROR');
+      setCellByHeader_(sheet, r, headerMap, 'status', 'N8N_ERROR');
+      setCellByHeader_(sheet, r, headerMap, 'error_text', String(e.message || e));
+      setCellByHeader_(sheet, r, headerMap, 'updated_at', nowString_());
+    }
+  }
+
+  SpreadsheetApp.getActive().toast(
+    'Выделенные строки отправлены. Отправлено: ' + sent + ', ошибок: ' + errors
+  );
+}
+
+function sendRowToN8n_(sheet, rowIndex, row, headerMap, promptConfig) {
+  const n8nWebhookUrl = getRequiredScriptProperty_(CONFIG.PROP_N8N_WEBHOOK_URL);
+  const callbackSecret = getCallbackSecret_();
+  const callbackUrl = getCallbackWebAppUrl_();
+
+  const payload = {
+    action: 'transcribe_and_analyze_call',
+    secret: callbackSecret,
+
+    call_key: getCellByHeader_(row, headerMap, 'call_key'),
+    filename_fixed: getCellByHeader_(row, headerMap, 'filename_fixed'),
+
+    call_datetime: getCellByHeader_(row, headerMap, 'call_datetime'),
+    call_date: getCellByHeader_(row, headerMap, 'call_date'),
+    call_time: getCellByHeader_(row, headerMap, 'call_time'),
+
+    direction: getCellByHeader_(row, headerMap, 'direction'),
+    client_phone: getCellByHeader_(row, headerMap, 'client_phone'),
+    mango_side: getCellByHeader_(row, headerMap, 'mango_side'),
+    line_name: getCellByHeader_(row, headerMap, 'line_name'),
+    operator_name: getCellByHeader_(row, headerMap, 'operator_name'),
+
+    drive_file_id: getCellByHeader_(row, headerMap, 'drive_file_id'),
+    drive_url: getCellByHeader_(row, headerMap, 'drive_url'),
+
+    prompt_version: promptConfig.prompt_version,
+
+    prompts: {
+      transcription_prompt: promptConfig.transcription_prompt,
+      analysis_prompt: promptConfig.analysis_prompt,
+      output_schema: promptConfig.output_schema || ''
+    },
+
+    callback: {
+      url: callbackUrl,
+      secret: callbackSecret
+    }
+  };
+
+  if (!payload.call_key) {
+    throw new Error('В строке нет call_key');
+  }
+
+  if (!payload.drive_file_id) {
+    throw new Error('В строке нет drive_file_id');
+  }
+
+  const response = UrlFetchApp.fetch(n8nWebhookUrl, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  const code = response.getResponseCode();
+  const body = response.getContentText();
+
+  if (code < 200 || code >= 300) {
+    throw new Error('n8n вернул HTTP ' + code + ': ' + body);
+  }
+
+  const now = nowString_();
+
+  setCellByHeader_(sheet, rowIndex, headerMap, 'status', 'SENT_TO_N8N');
+  setCellByHeader_(sheet, rowIndex, headerMap, 'n8n_status', 'SENT_TO_N8N');
+  setCellByHeader_(sheet, rowIndex, headerMap, 'n8n_sent_at', now);
+  setCellByHeader_(sheet, rowIndex, headerMap, 'prompt_version', promptConfig.prompt_version);
+  setCellByHeader_(sheet, rowIndex, headerMap, 'error_text', '');
+  setCellByHeader_(sheet, rowIndex, headerMap, 'updated_at', now);
+}
+
+/************************************************************
+ * CALLBACK FROM N8N
+ ************************************************************/
+
+function doPost(e) {
+  try {
+    const body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+
+    const expectedSecret = getCallbackSecret_();
+
+    if (body.secret !== expectedSecret) {
+      return jsonResponse_({
+        ok: false,
+        error: 'Forbidden: bad secret'
+      });
+    }
+
+    if (body.action === 'ping') {
+      return jsonResponse_({
+        ok: true,
+        message: 'pong'
+      });
+    }
+
+    if (body.action === 'n8n_call_result') {
+      const result = saveN8nCallResult_(body);
+
+      return jsonResponse_({
+        ok: true,
+        result: result
+      });
+    }
+
+    if (body.action === 'n8n_call_error') {
+      const result = saveN8nCallError_(body);
+
+      return jsonResponse_({
+        ok: true,
+        result: result
+      });
+    }
+
+    return jsonResponse_({
+      ok: false,
+      error: 'Unknown action: ' + body.action
+    });
+
+  } catch (err) {
+    return jsonResponse_({
+      ok: false,
+      error: String(err.message || err)
+    });
+  }
+}
+
+function doGet() {
+  return jsonResponse_({
+    ok: true,
+    service: 'Mango calls callback',
+    time: nowString_()
+  });
+}
+
+function saveN8nCallResult_(body) {
+  const sheet = getOrCreateSheet_();
+  ensureHeaders_(sheet);
+
+  const headerMap = getHeaderMap_(sheet);
+  const callKey = String(body.call_key || '').trim();
+
+  if (!callKey) {
+    throw new Error('В callback нет call_key');
+  }
+
+  const rowIndex = findRowByCallKey_(sheet, headerMap, callKey);
+
+  if (!rowIndex) {
+    throw new Error('Не найдена строка по call_key: ' + callKey);
+  }
+
+  const now = nowString_();
+
+  const transcriptText = String(body.transcript_text || '');
+
+  let analysis = body.analysis || {};
+
+  if (typeof analysis === 'string') {
+    analysis = safeJsonParse_(analysis) || {
+      raw: analysis
+    };
+  }
+
+  const analysisJson = JSON.stringify(analysis, null, 2);
+
+  const summary = String(
+    analysis.summary ||
+    body.analysis_summary ||
+    ''
+  );
+
+  const score = String(
+    analysis.score_1_5 ||
+    analysis.score ||
+    body.analysis_score ||
+    ''
+  );
+
+  const isProblem = normalizeBooleanForSheet_(
+    analysis.is_problem_call !== undefined
+      ? analysis.is_problem_call
+      : body.is_problem_call
+  );
+
+  setCellByHeader_(sheet, rowIndex, headerMap, 'transcript_text', transcriptText);
+  setCellByHeader_(sheet, rowIndex, headerMap, 'analysis_json', analysisJson);
+  setCellByHeader_(sheet, rowIndex, headerMap, 'analysis_summary', summary);
+  setCellByHeader_(sheet, rowIndex, headerMap, 'analysis_score', score);
+  setCellByHeader_(sheet, rowIndex, headerMap, 'is_problem_call', isProblem);
+
+  setCellByHeader_(sheet, rowIndex, headerMap, 'transcript_status', transcriptText ? 'OK' : '');
+  setCellByHeader_(sheet, rowIndex, headerMap, 'ai_status', analysisJson ? 'OK' : '');
+
+  setCellByHeader_(sheet, rowIndex, headerMap, 'n8n_status', 'ANALYZED');
+  setCellByHeader_(sheet, rowIndex, headerMap, 'status', 'ANALYZED');
+  setCellByHeader_(sheet, rowIndex, headerMap, 'n8n_result_at', now);
+  setCellByHeader_(sheet, rowIndex, headerMap, 'error_text', '');
+  setCellByHeader_(sheet, rowIndex, headerMap, 'updated_at', now);
+
+  return {
+    call_key: callKey,
+    row: rowIndex
+  };
+}
+
+function saveN8nCallError_(body) {
+  const sheet = getOrCreateSheet_();
+  ensureHeaders_(sheet);
+
+  const headerMap = getHeaderMap_(sheet);
+  const callKey = String(body.call_key || '').trim();
+
+  if (!callKey) {
+    throw new Error('В callback error нет call_key');
+  }
+
+  const rowIndex = findRowByCallKey_(sheet, headerMap, callKey);
+
+  if (!rowIndex) {
+    throw new Error('Не найдена строка по call_key: ' + callKey);
+  }
+
+  const now = nowString_();
+
+  setCellByHeader_(sheet, rowIndex, headerMap, 'n8n_status', 'N8N_ERROR');
+  setCellByHeader_(sheet, rowIndex, headerMap, 'status', 'N8N_ERROR');
+  setCellByHeader_(sheet, rowIndex, headerMap, 'error_text', String(body.error_text || body.error || 'Ошибка n8n'));
+  setCellByHeader_(sheet, rowIndex, headerMap, 'n8n_result_at', now);
+  setCellByHeader_(sheet, rowIndex, headerMap, 'updated_at', now);
+
+  return {
+    call_key: callKey,
+    row: rowIndex
+  };
+}
+
+/************************************************************
+ * BITRIX TASKS
+ ************************************************************/
+
+function createBitrixTasksForProblemCalls() {
+  const sheet = getOrCreateSheet_();
+  ensureHeaders_(sheet);
+
+  const headerMap = getHeaderMap_(sheet);
+
+  getRequiredScriptProperty_(CONFIG.PROP_BITRIX_WEBHOOK_BASE_URL);
+  getRequiredScriptProperty_(CONFIG.PROP_BITRIX_RESPONSIBLE_ID);
+
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) {
+    SpreadsheetApp.getActive().toast('Нет строк.');
+    return;
+  }
+
+  const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+
+  let created = 0;
+  let skipped = 0;
+  let errors = 0;
+
+  for (let i = 0; i < values.length; i++) {
+    const rowIndex = i + 2;
+    const row = values[i];
+
+    const status = getCellByHeader_(row, headerMap, 'status');
+    const isProblem = getCellByHeader_(row, headerMap, 'is_problem_call');
+    const taskId = getCellByHeader_(row, headerMap, 'bitrix_task_id');
+
+    if (status !== 'ANALYZED') {
+      skipped++;
+      continue;
+    }
+
+    if (!isTruthy_(isProblem)) {
+      skipped++;
+      continue;
+    }
+
+    if (taskId) {
+      skipped++;
+      continue;
+    }
+
+    try {
+      createBitrixTaskForRow_(sheet, rowIndex, row, headerMap);
+      created++;
+    } catch (e) {
+      errors++;
+      setCellByHeader_(sheet, rowIndex, headerMap, 'error_text', String(e.message || e));
+      setCellByHeader_(sheet, rowIndex, headerMap, 'updated_at', nowString_());
+    }
+  }
+
+  SpreadsheetApp.getActive().toast(
+    'Bitrix: создано ' + created + ', пропущено ' + skipped + ', ошибок ' + errors
+  );
+}
+
+function createBitrixTasksForSelectedRows() {
+  const sheet = getOrCreateSheet_();
+  ensureHeaders_(sheet);
+
+  const range = SpreadsheetApp.getActiveRange();
+
+  if (!range) {
+    SpreadsheetApp.getUi().alert('Выдели строки, по которым нужно создать задачи.');
+    return;
+  }
+
+  const headerMap = getHeaderMap_(sheet);
+
+  getRequiredScriptProperty_(CONFIG.PROP_BITRIX_WEBHOOK_BASE_URL);
+  getRequiredScriptProperty_(CONFIG.PROP_BITRIX_RESPONSIBLE_ID);
+
+  let created = 0;
+  let errors = 0;
+
+  for (let r = range.getRow(); r < range.getRow() + range.getNumRows(); r++) {
+    if (r === 1) continue;
+
+    const row = sheet.getRange(r, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+    try {
+      createBitrixTaskForRow_(sheet, r, row, headerMap);
+      created++;
+    } catch (e) {
+      errors++;
+      setCellByHeader_(sheet, r, headerMap, 'error_text', String(e.message || e));
+      setCellByHeader_(sheet, r, headerMap, 'updated_at', nowString_());
+    }
+  }
+
+  SpreadsheetApp.getActive().toast(
+    'Bitrix по выделенным: создано ' + created + ', ошибок ' + errors
+  );
+}
+
+function createBitrixTaskForRow_(sheet, rowIndex, row, headerMap) {
+  const existingTaskId = getCellByHeader_(row, headerMap, 'bitrix_task_id');
+
+  if (existingTaskId) {
+    throw new Error('Задача Bitrix уже создана: ' + existingTaskId);
+  }
+
+  const webhookBase = normalizeBitrixWebhookBase_(
+    getRequiredScriptProperty_(CONFIG.PROP_BITRIX_WEBHOOK_BASE_URL)
+  );
+
+  const responsibleId = getRequiredScriptProperty_(CONFIG.PROP_BITRIX_RESPONSIBLE_ID);
+
+  const callKey = getCellByHeader_(row, headerMap, 'call_key');
+  const callDateTime = getCellByHeader_(row, headerMap, 'call_datetime');
+  const direction = getCellByHeader_(row, headerMap, 'direction');
+  const clientPhone = getCellByHeader_(row, headerMap, 'client_phone');
+  const mangoSide = getCellByHeader_(row, headerMap, 'mango_side');
+  const operatorName = getCellByHeader_(row, headerMap, 'operator_name');
+  const driveUrl = getCellByHeader_(row, headerMap, 'drive_url');
+  const analysisSummary = getCellByHeader_(row, headerMap, 'analysis_summary');
+  const analysisScore = getCellByHeader_(row, headerMap, 'analysis_score');
+  const analysisJson = getCellByHeader_(row, headerMap, 'analysis_json');
+  const transcriptText = getCellByHeader_(row, headerMap, 'transcript_text');
+
+  const title = 'Проверить проблемный звонок: ' + callDateTime + ' / ' + clientPhone;
+
+  const description = [
+    'Проблемный звонок по результатам AI-анализа.',
+    '',
+    'Дата/время: ' + callDateTime,
+    'Направление: ' + direction,
+    'Клиентский телефон: ' + clientPhone,
+    'Наша сторона: ' + mangoSide,
+    'Оператор: ' + operatorName,
+    '',
+    'Аудиозапись:',
+    driveUrl,
+    '',
+    'Оценка AI: ' + analysisScore,
+    '',
+    'Краткое резюме:',
+    analysisSummary || '—',
+    '',
+    'JSON анализа:',
+    truncateText_(analysisJson || '—', 4000),
+    '',
+    'Транскрипт:',
+    truncateText_(transcriptText || '—', 4000),
+    '',
+    'call_key:',
+    callKey
+  ].join('\n');
+
+  const url = webhookBase + '/tasks.task.add.json';
+
+  const payload = {
+    fields: {
+      TITLE: title,
+      DESCRIPTION: description,
+      RESPONSIBLE_ID: Number(responsibleId)
+    }
+  };
+
+  const response = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  const code = response.getResponseCode();
+  const body = response.getContentText();
+
+  if (code < 200 || code >= 300) {
+    throw new Error('Bitrix HTTP ' + code + ': ' + body);
+  }
+
+  const data = safeJsonParse_(body);
+
+  if (!data) {
+    throw new Error('Bitrix вернул не JSON: ' + body);
+  }
+
+  if (data.error) {
+    throw new Error('Bitrix error: ' + data.error + ' ' + (data.error_description || ''));
+  }
+
+  const taskId =
+    data.result &&
+    data.result.task &&
+    data.result.task.id
+      ? data.result.task.id
+      : data.result && data.result.id
+        ? data.result.id
+        : data.result;
+
+  if (!taskId) {
+    throw new Error('Не удалось получить ID задачи Bitrix: ' + body);
+  }
+
+  const taskUrl = buildBitrixTaskUrl_(webhookBase, responsibleId, taskId);
+  const now = nowString_();
+
+  setCellByHeader_(sheet, rowIndex, headerMap, 'bitrix_task_id', String(taskId));
+  setCellByHeader_(sheet, rowIndex, headerMap, 'bitrix_task_url', taskUrl);
+  setCellByHeader_(sheet, rowIndex, headerMap, 'updated_at', now);
+
+  return {
+    task_id: taskId,
+    task_url: taskUrl
+  };
+}
+
+function normalizeBitrixWebhookBase_(url) {
+  return String(url || '').trim().replace(/\/+$/, '');
+}
+
+function buildBitrixTaskUrl_(webhookBase, responsibleId, taskId) {
+  const match = String(webhookBase || '').match(/^(https?:\/\/[^/]+)/i);
+  const origin = match ? match[1] : '';
+
+  if (!origin) return '';
+
+  return origin + '/company/personal/user/' + responsibleId + '/tasks/task/view/' + taskId + '/';
+}
+
+/************************************************************
+ * HELPERS: SHEET
+ ************************************************************/
+
+function getOrCreateSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(CONFIG.SHEET_NAME);
+  }
+
+  return sheet;
+}
+
+function ensureHeaders_(sheet) {
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+
+  if (lastRow === 0 || lastColumn === 0) {
+    sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
+    sheet.setFrozenRows(1);
+    return;
+  }
+
+  const firstRow = sheet
+    .getRange(1, 1, 1, Math.max(lastColumn, HEADERS.length))
+    .getValues()[0]
+    .map(String)
+    .map(s => s.trim());
+
+  const existingHeaders = firstRow.filter(Boolean);
+
+  if (existingHeaders.length === 0) {
+    sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
+    sheet.setFrozenRows(1);
+    return;
+  }
+
+  const missing = HEADERS.filter(h => existingHeaders.indexOf(h) === -1);
+
+  if (missing.length > 0) {
+    sheet
+      .getRange(1, existingHeaders.length + 1, 1, missing.length)
+      .setValues([missing]);
+  }
+
+  sheet.setFrozenRows(1);
+}
+
+function getHeaderMap_(sheet) {
+  const headers = sheet
+    .getRange(1, 1, 1, sheet.getLastColumn())
+    .getValues()[0]
+    .map(String)
+    .map(s => s.trim());
+
+  const map = {};
+
+  headers.forEach((h, index) => {
+    if (h) map[h] = index + 1;
+  });
+
+  return map;
+}
+
+function loadExistingCallKeys_(sheet, headerMap) {
+  const set = new Set();
+
+  const callKeyCol = headerMap.call_key;
+  if (!callKeyCol) return set;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return set;
+
+  const values = sheet
+    .getRange(2, callKeyCol, lastRow - 1, 1)
+    .getValues();
+
+  values.forEach(row => {
+    const key = String(row[0] || '').trim();
+    if (key) set.add(key);
+  });
+
+  return set;
+}
+
+function makeRowByHeaders_(obj) {
+  return HEADERS.map(h => {
+    return Object.prototype.hasOwnProperty.call(obj, h) ? obj[h] : '';
+  });
+}
+
+function getCellByHeader_(row, headerMap, headerName) {
+  const col = headerMap[headerName];
+
+  if (!col) return '';
+
+  return String(row[col - 1] || '').trim();
+}
+
+function setCellByHeader_(sheet, rowIndex, headerMap, headerName, value) {
+  const col = headerMap[headerName];
+
+  if (!col) {
+    throw new Error('Не найдена колонка: ' + headerName);
+  }
+
+  sheet.getRange(rowIndex, col).setValue(value);
+}
+
+function findRowByCallKey_(sheet, headerMap, callKey) {
+  const col = headerMap.call_key;
+
+  if (!col) {
+    throw new Error('Нет колонки call_key');
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  const values = sheet.getRange(2, col, lastRow - 1, 1).getValues();
+
+  for (let i = 0; i < values.length; i++) {
+    if (String(values[i][0] || '').trim() === callKey) {
+      return i + 2;
+    }
+  }
+
+  return null;
+}
+
+/************************************************************
+ * HELPERS: GENERAL
+ ************************************************************/
+
+function testFixSelectedCell() {
+  const range = SpreadsheetApp.getActiveRange();
+
+  if (!range) {
+    SpreadsheetApp.getUi().alert('Выдели ячейку с кривым названием файла.');
+    return;
+  }
+
+  const raw = String(range.getValue() || '');
+  const fixed = normalizeMangoFilename_(raw);
+
+  range.offset(0, 1).setValue(fixed);
+
+  SpreadsheetApp.getActive().toast('Исправленное имя записано в ячейку справа.');
+}
+
+function isPhone_(value) {
+  return /^\d{7,15}$/.test(String(value || '').trim());
+}
+
+function isMp3_(filename) {
+  return /\.mp3$/i.test(String(filename || ''));
+}
+
+function stripExtension_(filename) {
+  return String(filename || '').replace(/\.[^.]+$/, '');
+}
+
+function sanitizeDriveFilename_(name) {
+  return String(name || '')
+    .replace(/[\/\\]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function nowString_() {
+  return Utilities.formatDate(
+    new Date(),
+    Session.getScriptTimeZone(),
+    'yyyy-MM-dd HH:mm:ss'
+  );
+}
+
+function jsonResponse_(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function safeJsonParse_(text) {
+  try {
+    return JSON.parse(String(text || ''));
+  } catch (e) {
+    return null;
+  }
+}
+
+function truncateText_(text, maxLength) {
+  const s = String(text || '');
+
+  if (s.length <= maxLength) return s;
+
+  return s.slice(0, maxLength) + '\n\n...[обрезано, всего символов: ' + s.length + ']';
+}
+
+function normalizeBooleanForSheet_(value) {
+  if (value === true) return 'TRUE';
+  if (value === false) return 'FALSE';
+
+  const s = String(value || '').trim().toLowerCase();
+
+  if (['true', '1', 'yes', 'да', 'истина'].indexOf(s) !== -1) return 'TRUE';
+  if (['false', '0', 'no', 'нет', 'ложь'].indexOf(s) !== -1) return 'FALSE';
+
+  return '';
+}
+
+function isTruthy_(value) {
+  const s = String(value || '').trim().toLowerCase();
+  return ['true', '1', 'yes', 'да', 'истина'].indexOf(s) !== -1;
+}
+
+/************************************************************
+ * ENCODING FIX
+ ************************************************************/
+
+function shouldUseDecodedName_(original, decoded) {
+  if (!decoded || original === decoded) return false;
+
+  if (!hasSuspiciousEncodingChars_(original)) return false;
+
+  const originalScore = filenameHumanScore_(original);
+  const decodedScore = filenameHumanScore_(decoded);
+
+  return decodedScore > originalScore;
+}
+
+function hasSuspiciousEncodingChars_(text) {
+  return /[\u0300-\u036F†‡¶®©™ЂЃ§ҐґЈјЅѕЉљЊњЋћЌќЇїІіЄєµ≤≥≈∆∞±√ƒ«»…]/.test(String(text || ''));
+}
+
+function filenameHumanScore_(text) {
+  const s = String(text || '');
+
+  const russianLetters = (s.match(/[А-Яа-яЁё]/g) || []).length;
+  const digits = (s.match(/\d/g) || []).length;
+  const suspicious = (s.match(/[\u0300-\u036F†‡¶®©™ЂЃ§ҐґЈјЅѕЉљЊњЋћЌќЇїІіЄєµ≤≥≈∆∞±√ƒ«»…]/g) || []).length;
+  const replacement = (s.match(/�/g) || []).length;
+
+  return russianLetters * 3 + digits - suspicious * 8 - replacement * 20;
+}
+
+/**
+ * Восстановление случая:
+ * CP866 / DOS Cyrillic был прочитан как MacCyrillic.
+ */
+function decodeMacCyrillicAsCp866_(text) {
+  const source = String(text || '').normalize('NFC');
+
+  const macChars = getMacCyrillicChars128_();
+  const cp866Chars = getCp866Chars128_();
+
+  const macCharToByte = {};
+
+  for (let i = 0; i < macChars.length; i++) {
+    macCharToByte[macChars[i]] = 128 + i;
+  }
+
+  let result = '';
+
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    const code = ch.charCodeAt(0);
+
+    if (code <= 127) {
+      result += ch;
+      continue;
+    }
+
+    const byteValue = macCharToByte[ch];
+
+    if (byteValue === undefined) {
+      result += ch;
+      continue;
+    }
+
+    result += cp866Chars[byteValue - 128] || ch;
+  }
+
+  return result;
+}
+
+/**
+ * CP866: байты 128–255.
+ */
+function getCp866Chars128_() {
+  return [
+    '\u0410', '\u0411', '\u0412', '\u0413', '\u0414', '\u0415', '\u0416', '\u0417', '\u0418', '\u0419', '\u041A', '\u041B', '\u041C', '\u041D', '\u041E', '\u041F',
+    '\u0420', '\u0421', '\u0422', '\u0423', '\u0424', '\u0425', '\u0426', '\u0427', '\u0428', '\u0429', '\u042A', '\u042B', '\u042C', '\u042D', '\u042E', '\u042F',
+    '\u0430', '\u0431', '\u0432', '\u0433', '\u0434', '\u0435', '\u0436', '\u0437', '\u0438', '\u0439', '\u043A', '\u043B', '\u043C', '\u043D', '\u043E', '\u043F',
+    '\u2591', '\u2592', '\u2593', '\u2502', '\u2524', '\u2561', '\u2562', '\u2556', '\u2555', '\u2563', '\u2551', '\u2557', '\u255D', '\u255C', '\u255B', '\u2510',
+    '\u2514', '\u2534', '\u252C', '\u251C', '\u2500', '\u253C', '\u255E', '\u255F', '\u255A', '\u2554', '\u2569', '\u2566', '\u2560', '\u2550', '\u256C', '\u2567',
+    '\u2568', '\u2564', '\u2565', '\u2559', '\u2558', '\u2552', '\u2553', '\u256B', '\u256A', '\u2518', '\u250C', '\u2588', '\u2584', '\u258C', '\u2590', '\u2580',
+    '\u0440', '\u0441', '\u0442', '\u0443', '\u0444', '\u0445', '\u0446', '\u0447', '\u0448', '\u0449', '\u044A', '\u044B', '\u044C', '\u044D', '\u044E', '\u044F',
+    '\u0401', '\u0451', '\u0404', '\u0454', '\u0407', '\u0457', '\u040E', '\u045E', '\u00B0', '\u2219', '\u00B7', '\u221A', '\u2116', '\u00A4', '\u25A0', '\u00A0'
+  ];
+}
+
+/**
+ * MacCyrillic: байты 128–255.
+ */
+function getMacCyrillicChars128_() {
+  return [
+    '\u0410', '\u0411', '\u0412', '\u0413', '\u0414', '\u0415', '\u0416', '\u0417', '\u0418', '\u0419', '\u041A', '\u041B', '\u041C', '\u041D', '\u041E', '\u041F',
+    '\u0420', '\u0421', '\u0422', '\u0423', '\u0424', '\u0425', '\u0426', '\u0427', '\u0428', '\u0429', '\u042A', '\u042B', '\u042C', '\u042D', '\u042E', '\u042F',
+    '\u2020', '\u00B0', '\u0490', '\u00A3', '\u00A7', '\u2022', '\u00B6', '\u0406', '\u00AE', '\u00A9', '\u2122', '\u0402', '\u0452', '\u2260', '\u0403', '\u0453',
+    '\u221E', '\u00B1', '\u2264', '\u2265', '\u0456', '\u00B5', '\u0491', '\u0408', '\u0404', '\u0454', '\u0407', '\u0457', '\u0409', '\u0459', '\u040A', '\u045A',
+    '\u0458', '\u0405', '\u00AC', '\u221A', '\u0192', '\u2248', '\u2206', '\u00AB', '\u00BB', '\u2026', '\u00A0', '\u040B', '\u045B', '\u040C', '\u045C', '\u0455',
+    '\u2013', '\u2014', '\u201C', '\u201D', '\u2018', '\u2019', '\u00F7', '\u201E', '\u040E', '\u045E', '\u040F', '\u045F', '\u2116', '\u0401', '\u0451', '\u044F',
+    '\u0430', '\u0431', '\u0432', '\u0433', '\u0434', '\u0435', '\u0436', '\u0437', '\u0438', '\u0439', '\u043A', '\u043B', '\u043C', '\u043D', '\u043E', '\u043F',
+    '\u0440', '\u0441', '\u0442', '\u0443', '\u0444', '\u0445', '\u0446', '\u0447', '\u0448', '\u0449', '\u044A', '\u044B', '\u044C', '\u044D', '\u044E', '\u20AC'
+  ];
+}

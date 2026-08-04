@@ -1,0 +1,527 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "mango-call-transcribe-stereo-safe-v2",
+        "options": {}
+      },
+      "id": "4d2e0cd5-7979-46da-86b4-828ed702371a",
+      "name": "Webhook Mango Call",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -2336,
+        -128
+      ],
+      "webhookId": "07b9d2b9-1ee8-465d-912c-8abba49d68db"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst body = input.body || input;\n\nif (body.action !== 'transcribe_and_analyze_call') {\n  throw new Error(`Unknown action: ${body.action}`);\n}\n\nif (!body.call_key) throw new Error('Missing call_key');\nif (!body.drive_file_id) throw new Error('Missing drive_file_id');\n\nif (!body.callback?.url || !body.callback?.secret) {\n  throw new Error('Missing callback.url or callback.secret');\n}\n\nif (!body.prompts?.transcription_prompt) {\n  throw new Error('Missing prompts.transcription_prompt');\n}\n\nif (!Array.isArray(body.prompts?.evaluation_rules) || body.prompts.evaluation_rules.length === 0) {\n  throw new Error('Missing prompts.evaluation_rules');\n}\n\nconst tempId = `mango_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;\n\nreturn [\n  {\n    json: {\n      action: body.action,\n\n      call_key: body.call_key,\n      filename_fixed: body.filename_fixed || '',\n\n      call_datetime: body.call_datetime || '',\n      call_date: body.call_date || '',\n      call_time: body.call_time || '',\n\n      direction: body.direction || '',\n      client_phone: body.client_phone || '',\n      mango_side: body.mango_side || '',\n      line_name: body.line_name || '',\n      operator_name: body.operator_name || '',\n\n      drive_file_id: body.drive_file_id,\n      drive_url: body.drive_url || '',\n\n      prompt_version: body.prompt_version || body.prompts.prompt_version || '',\n\n      prompts: {\n        prompt_version: body.prompts.prompt_version || body.prompt_version || '',\n        transcription_prompt: body.prompts.transcription_prompt || '',\n        analysis_system_prompt: body.prompts.analysis_system_prompt || '',\n        output_schema: body.prompts.output_schema || '',\n        evaluation_rules: body.prompts.evaluation_rules\n      },\n\n      callback: {\n        url: body.callback.url,\n        secret: body.callback.secret\n      },\n\n      temp: {\n        id: tempId,\n        inputPath: `/tmp/${tempId}.mp3`,\n        leftPath: `/tmp/${tempId}_left.wav`,\n        rightPath: `/tmp/${tempId}_right.wav`,\n        splitLogPath: `/tmp/${tempId}_split.log`\n      }\n    }\n  }\n];"
+      },
+      "id": "fd50e9c0-b4a8-4c48-be94-76c252be1621",
+      "name": "Normalize Incoming Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2096,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.drive_file_id }}",
+          "mode": "id"
+        },
+        "options": {
+          "binaryPropertyName": "audio"
+        }
+      },
+      "id": "f653e071-33a3-491a-b723-b0d77d42bd48",
+      "name": "Google Drive - Download audio",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        -1856,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const meta = $items('Normalize Incoming Payload')[0].json;\nconst current = $input.first();\n\nif (!current.binary || !current.binary.audio) {\n  throw new Error('Google Drive node did not return binary field \"audio\"');\n}\n\nreturn [\n  {\n    json: meta,\n    binary: {\n      audio: current.binary.audio\n    }\n  }\n];"
+      },
+      "id": "fd12723e-4eac-4e7d-8898-ac3b72f30f4d",
+      "name": "Attach Meta To Audio",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1616,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "fileName": "={{ $json.temp.inputPath }}",
+        "dataPropertyName": "audio",
+        "options": {}
+      },
+      "id": "2bcbdeb2-81b3-4a50-b490-4b4b0e75ded5",
+      "name": "Write Source Audio To Disk",
+      "type": "n8n-nodes-base.writeBinaryFile",
+      "typeVersion": 1,
+      "position": [
+        -1376,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const meta = $items('Attach Meta To Audio')[0].json;\n\nif (!meta.temp?.inputPath || !meta.temp?.leftPath || !meta.temp?.rightPath) {\n  throw new Error('Missing temp paths before FFmpeg Split Channels');\n}\n\nreturn [\n  {\n    json: meta\n  }\n];"
+      },
+      "id": "e923a78d-0c4d-40f3-81a6-fd26aafa66e1",
+      "name": "Prepare FFmpeg Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1136,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "command": "=IN='{{ $json.temp.inputPath }}'; L='{{ $json.temp.leftPath }}'; R='{{ $json.temp.rightPath }}'; LOG='{{ $json.temp.splitLogPath }}'; echo \"IN=$IN\"; echo \"L=$L\"; echo \"R=$R\"; echo \"LOG=$LOG\"; echo \"--- ffmpeg ---\"; /usr/bin/ffmpeg -version | head -n 1; echo \"--- ffprobe ---\"; /usr/bin/ffprobe -version | head -n 1; CH=$(/usr/bin/ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 \"$IN\" 2>/dev/null); echo \"CH=$CH\"; MV=$(/usr/bin/ffmpeg -hide_banner -i \"$IN\" -af volumedetect -f null - 2>&1 | grep mean_volume | sed 's/.*: //; s/ dB//'); echo \"MV=$MV\"; if [ -n \"$MV\" ] && awk -v v=\"$MV\" 'BEGIN{exit !(v < -45)}'; then echo \"EMPTY:$MV\"; elif [ \"$CH\" = \"2\" ]; then if /usr/bin/ffmpeg -hide_banner -loglevel error -i \"$IN\" -filter_complex \"channelsplit=channel_layout=stereo[l][r];[l]aformat=channel_layouts=mono[L];[r]aformat=channel_layouts=mono[R]\" -map \"[L]\" -ar 16000 -ac 1 -y \"$L\" -map \"[R]\" -ar 16000 -ac 1 -y \"$R\" 2>\"$LOG\"; then if [ -s \"$L\" ] && [ -s \"$R\" ]; then echo \"OK:stereo:$MV\"; else echo \"ERROR: пустые файлы после разделения каналов\"; exit 1; fi; else echo \"ERROR: $(tail -c 1500 \"$LOG\" | tr '\\n' ' ')\"; exit 1; fi; elif [ \"$CH\" = \"1\" ]; then if /usr/bin/ffmpeg -hide_banner -loglevel error -i \"$IN\" -ar 16000 -ac 1 -y \"$L\" 2>\"$LOG\"; then if [ -s \"$L\" ]; then cp \"$L\" \"$R\"; echo \"OK:mono:$MV\"; else echo \"ERROR: пустой файл после конвертации\"; exit 1; fi; else echo \"ERROR: $(tail -c 1500 \"$LOG\" | tr '\\n' ' ')\"; exit 1; fi; else echo \"ERROR: неожиданное число каналов: $CH\"; exit 1; fi"
+      },
+      "id": "b89e535c-1722-49e7-962a-a00843eb97c1",
+      "name": "FFmpeg Split Channels",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -896,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "filePath": "={{ $items('Prepare FFmpeg Input')[0].json.temp.leftPath }}",
+        "dataPropertyName": "audio"
+      },
+      "id": "4aa18a2b-0cf9-4653-aa4f-8c06b034936e",
+      "name": "Read Left Channel",
+      "type": "n8n-nodes-base.readBinaryFile",
+      "typeVersion": 1,
+      "position": [
+        -656,
+        -304
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "audio",
+        "operation": "transcribe",
+        "binaryPropertyName": "audio",
+        "options": {
+          "language": "ru"
+        }
+      },
+      "id": "04814bb4-edec-48dc-ada9-2732147b9fe5",
+      "name": "OpenAI - Transcribe left",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [
+        -416,
+        -304
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "AYsswqQnu0370Vfk",
+          "name": "OpenAi [ temed | cid ]"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = $input.first().json;\nconst meta = $items('Prepare FFmpeg Input')[0].json;\n\nconst text =\n  out.text ||\n  out.transcript ||\n  out.transcription ||\n  out.data?.text ||\n  out.message?.content ||\n  out.output ||\n  '';\n\nif (!text) {\n  throw new Error('Empty left channel transcript');\n}\n\nreturn [\n  {\n    json: {\n      ...meta,\n      channel: 'left',\n      transcript_left: String(text).trim()\n    }\n  }\n];"
+      },
+      "id": "d8b2377e-2c0e-423c-b01c-22f3628e43d7",
+      "name": "Prepare Left Transcript",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -176,
+        -304
+      ]
+    },
+    {
+      "parameters": {
+        "filePath": "={{ $items('Prepare FFmpeg Input')[0].json.temp.rightPath }}",
+        "dataPropertyName": "audio"
+      },
+      "id": "3d2d0d80-315d-4d89-ab34-10fa775ee9c8",
+      "name": "Read Right Channel",
+      "type": "n8n-nodes-base.readBinaryFile",
+      "typeVersion": 1,
+      "position": [
+        -656,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "audio",
+        "operation": "transcribe",
+        "binaryPropertyName": "audio",
+        "options": {
+          "language": "ru"
+        }
+      },
+      "id": "88dd9bc4-1022-4bb5-9cec-5a44bf4f1e10",
+      "name": "OpenAI - Transcribe right",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [
+        -416,
+        64
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "AYsswqQnu0370Vfk",
+          "name": "OpenAi [ temed | cid ]"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = $input.first().json;\nconst meta = $items('Prepare FFmpeg Input')[0].json;\n\nconst text =\n  out.text ||\n  out.transcript ||\n  out.transcription ||\n  out.data?.text ||\n  out.message?.content ||\n  out.output ||\n  '';\n\nif (!text) {\n  throw new Error('Empty right channel transcript');\n}\n\nreturn [\n  {\n    json: {\n      ...meta,\n      channel: 'right',\n      transcript_right: String(text).trim()\n    }\n  }\n];"
+      },
+      "id": "69270772-97d7-4ac1-9cdc-65d0f96725cb",
+      "name": "Prepare Right Transcript",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -176,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "978fb61e-336c-440f-9655-df47e2b04c4d",
+      "name": "Merge Left + Right",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        96,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const leftItem = $items('Prepare Left Transcript')[0]?.json || {};\nconst rightItem = $items('Prepare Right Transcript')[0]?.json || {};\nconst baseMeta = $items('Prepare FFmpeg Input')[0]?.json || {};\n\nconst meta = {\n  ...baseMeta,\n  ...leftItem,\n  ...rightItem\n};\n\nif (!leftItem.transcript_left) {\n  throw new Error('No transcript_left');\n}\n\nif (!rightItem.transcript_right) {\n  throw new Error('No transcript_right');\n}\n\nconst transcriptChannels = {\n  left: leftItem.transcript_left,\n  right: rightItem.transcript_right\n};\n\nconst transcriptText = [\n  'Двухканальная запись телефонного разговора.',\n  '',\n  'Канал left:',\n  transcriptChannels.left,\n  '',\n  'Канал right:',\n  transcriptChannels.right\n].join('\\n');\n\nconst systemPrompt = meta.prompts.analysis_system_prompt || [\n  'Ты анализируешь звонки операторов клиники TEMED.',\n  'Оценивай звонок только по переданным evaluation_rules.',\n  'Не добавляй новых правил от себя.',\n  'Верни только валидный JSON без markdown.',\n  'Не выдумывай факты, которых нет в транскрипте.',\n  'Не оценивай клиническую правильность лечения.',\n  'Не проверяй цены, скидки, акции, расписание, предоплату, рассрочку и коммерческие условия.'\n].join(' ');\n\nconst callMeta = [\n  `call_key: ${meta.call_key}`,\n  `Дата/время: ${meta.call_datetime}`,\n  `Направление: ${meta.direction}`,\n  `Телефон клиента: ${meta.client_phone}`,\n  `Наша сторона: ${meta.mango_side}`,\n  `Линия: ${meta.line_name}`,\n  `Оператор: ${meta.operator_name}`\n].join('\\n');\n\nconst defaultSchema = {\n  summary: 'Краткое содержание звонка',\n  overall_score: 'Число 1-5, взвешенная итоговая оценка без учета N/A',\n  problem_level: 'NONE | LOW | MEDIUM | HIGH | CRITICAL',\n  is_problem_call: 'boolean',\n  channel_roles: {\n    left: 'operator | client | unknown',\n    right: 'operator | client | unknown',\n    confidence: 'low | medium | high',\n    reason: 'почему роли распределены именно так'\n  },\n  main_strength: 'Главная сильная сторона оператора',\n  main_error: 'Главная ошибка оператора',\n  recommended_feedback: 'Краткая рекомендация для обратной связи оператору',\n  rule_results: [\n    {\n      rule_id: 'строго один из rule_id из evaluation_rules',\n      score: 'число 1-5 или null если N/A',\n      is_na: 'boolean',\n      reason: 'почему такая оценка',\n      evidence: 'фрагмент или наблюдение из звонка',\n      recommendation: 'что улучшить или сохранить'\n    }\n  ]\n};\n\nconst userPrompt = [\n  'Проанализируй двухканальную запись телефонного разговора оператора клиники TEMED.',\n  '',\n  'Данные звонка:',\n  callMeta,\n  '',\n  'Важно про каналы:',\n  '1. Запись стерео разделена на два канала: left и right.',\n  '2. Один канал обычно содержит речь оператора, второй — речь клиента.',\n  '3. Сначала определи, какой канал вероятнее оператор, а какой клиент.',\n  '4. Если не уверен, укажи unknown и объясни причину.',\n  '5. Оператор обычно представляется, говорит от имени клиники, задает вопросы, предлагает запись или следующий шаг.',\n  '6. Клиент обычно отвечает на вопросы, описывает проблему, сомневается или задает уточняющие вопросы.',\n  '',\n  'Правила оценки evaluation_rules:',\n  JSON.stringify(meta.prompts.evaluation_rules, null, 2),\n  '',\n  'Инструкция:',\n  '1. Оцени звонок по каждому правилу из evaluation_rules.',\n  '2. Для каждого правила верни результат с тем же rule_id.',\n  '3. Не добавляй новых rule_id.',\n  '4. Если правило неприменимо и na_allowed = true, поставь is_na = true и score = null.',\n  '5. Если правило применимо, поставь is_na = false и score от 1 до 5.',\n  '6. Обязательно дай reason, evidence и recommendation.',\n  '7. N/A не участвует в overall_score.',\n  '8. overall_score считай с учетом weight.',\n  '9. Если score <= critical_if_score_lte по любому правилу, problem_level минимум HIGH и is_problem_call = true.',\n  '10. Если score <= problem_if_score_lte по любому правилу, problem_level минимум MEDIUM и is_problem_call = true.',\n  '11. Не проверяй цены, скидки, акции, расписание и коммерческие условия.',\n  '',\n  'Транскрипт канала left:',\n  transcriptChannels.left,\n  '',\n  'Транскрипт канала right:',\n  transcriptChannels.right,\n  '',\n  'Формат ответа:',\n  meta.prompts.output_schema || JSON.stringify(defaultSchema, null, 2),\n  '',\n  'Обязательно добавь в JSON поле channel_roles.',\n  'Верни только JSON без markdown.'\n].join('\\n');\n\nreturn [\n  {\n    json: {\n      ...meta,\n      transcript_text: transcriptText,\n      transcript_channels: transcriptChannels,\n      systemPrompt,\n      userPrompt\n    }\n  }\n];"
+      },
+      "id": "e95b8187-bc99-446a-8513-07eb423f3db8",
+      "name": "Build Analysis Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        352,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-5-mini",
+          "mode": "id"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "={{ $json.systemPrompt }}",
+              "role": "system"
+            },
+            {
+              "content": "={{ $json.userPrompt }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "5c6cdb94-0757-4ba7-84c4-ad0671cd7376",
+      "name": "gpt-5-mini",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [
+        608,
+        -128
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "AYsswqQnu0370Vfk",
+          "name": "OpenAi [ temed | cid ]"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const current = $input.first().json;\nconst meta = $items('Build Analysis Request')[0].json;\n\nconst raw =\n  current.message?.content ||\n  current.choices?.[0]?.message?.content ||\n  current.output ||\n  current.text ||\n  current.response ||\n  current.data ||\n  '';\n\nfunction parseJsonSafe(value) {\n  if (typeof value === 'object' && value !== null) return value;\n\n  const s = String(value || '').trim();\n  if (!s) return null;\n\n  try { return JSON.parse(s); } catch (e) {}\n\n  const cleaned = s\n    .replace(/^```json/i, '')\n    .replace(/^```/i, '')\n    .replace(/```$/i, '')\n    .trim();\n\n  try { return JSON.parse(cleaned); } catch (e) {}\n\n  const first = cleaned.indexOf('{');\n  const last = cleaned.lastIndexOf('}');\n\n  if (first !== -1 && last !== -1 && last > first) {\n    try { return JSON.parse(cleaned.slice(first, last + 1)); } catch (e) {}\n  }\n\n  return null;\n}\n\nfunction normalizeProblemLevel(value) {\n  const allowed = ['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];\n  const s = String(value || '').trim().toUpperCase();\n  return allowed.includes(s) ? s : 'NONE';\n}\n\nfunction normalizeBoolean(value) {\n  if (value === true) return true;\n  if (value === false) return false;\n\n  const s = String(value || '').trim().toLowerCase();\n  if (['true', '1', 'yes', 'да', 'истина'].includes(s)) return true;\n  if (['false', '0', 'no', 'нет', 'ложь'].includes(s)) return false;\n\n  return false;\n}\n\nfunction normalizeScore(value) {\n  if (value === null || value === undefined || value === '') return null;\n  const n = Number(value);\n  if (!Number.isFinite(n)) return null;\n  if (n < 1) return 1;\n  if (n > 5) return 5;\n  return n;\n}\n\nfunction asArray(value) {\n  return Array.isArray(value) ? value : [];\n}\n\nlet analysis = parseJsonSafe(raw);\n\nif (!analysis) {\n  analysis = {\n    summary: '',\n    overall_score: null,\n    problem_level: 'HIGH',\n    is_problem_call: true,\n    channel_roles: {\n      left: 'unknown',\n      right: 'unknown',\n      confidence: 'low',\n      reason: 'AI вернул невалидный JSON'\n    },\n    main_strength: '',\n    main_error: 'AI вернул невалидный JSON',\n    recommended_feedback: 'Проверить звонок вручную.',\n    rule_results: [],\n    raw_ai_response: String(raw || '')\n  };\n}\n\nanalysis = {\n  summary: String(analysis.summary || ''),\n  overall_score: normalizeScore(analysis.overall_score),\n  problem_level: normalizeProblemLevel(analysis.problem_level),\n  is_problem_call: normalizeBoolean(analysis.is_problem_call),\n  channel_roles: analysis.channel_roles || {\n    left: 'unknown',\n    right: 'unknown',\n    confidence: 'low',\n    reason: ''\n  },\n  main_strength: String(analysis.main_strength || ''),\n  main_error: String(analysis.main_error || ''),\n  recommended_feedback: String(analysis.recommended_feedback || ''),\n  rule_results: asArray(analysis.rule_results)\n    .map(r => ({\n      rule_id: String(r.rule_id || ''),\n      score: normalizeScore(r.score),\n      is_na: normalizeBoolean(r.is_na),\n      reason: String(r.reason || ''),\n      evidence: String(r.evidence || ''),\n      recommendation: String(r.recommendation || '')\n    }))\n    .filter(r => r.rule_id)\n};\n\nreturn [\n  {\n    json: {\n      callbackUrl: String(meta.callback.url || '').trim(),\n      callbackBody: {\n        action: 'n8n_call_result',\n        secret: meta.callback.secret,\n        call_key: meta.call_key,\n        prompt_version: meta.prompt_version || meta.prompts.prompt_version || '',\n        transcript_text: meta.transcript_text,\n        transcript_channels: meta.transcript_channels,\n        analysis\n      },\n      temp: meta.temp\n    }\n  }\n];"
+      },
+      "id": "519e7824-fb6c-4fab-9212-a45fed716045",
+      "name": "Prepare Apps Script Callback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ String($json.callbackUrl || '').trim() }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.callbackBody }}",
+        "options": {}
+      },
+      "id": "a495d952-ec02-4858-9423-47a1db8d58f2",
+      "name": "Callback to Apps Script",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1136,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "command": "=rm -f '{{ $items(\"Prepare Apps Script Callback\")[0].json.temp.inputPath }}' '{{ $items(\"Prepare Apps Script Callback\")[0].json.temp.leftPath }}' '{{ $items(\"Prepare Apps Script Callback\")[0].json.temp.rightPath }}' '{{ $items(\"Prepare Apps Script Callback\")[0].json.temp.splitLogPath }}'"
+      },
+      "id": "8ecf4209-e9b8-476d-b8dc-387921abe46e",
+      "name": "Cleanup Temp Files",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1392,
+        -128
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook Mango Call": {
+      "main": [
+        [
+          {
+            "node": "Normalize Incoming Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Incoming Payload": {
+      "main": [
+        [
+          {
+            "node": "Google Drive - Download audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Drive - Download audio": {
+      "main": [
+        [
+          {
+            "node": "Attach Meta To Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Meta To Audio": {
+      "main": [
+        [
+          {
+            "node": "Write Source Audio To Disk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Source Audio To Disk": {
+      "main": [
+        [
+          {
+            "node": "Prepare FFmpeg Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare FFmpeg Input": {
+      "main": [
+        [
+          {
+            "node": "FFmpeg Split Channels",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "FFmpeg Split Channels": {
+      "main": [
+        [
+          {
+            "node": "Read Left Channel",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Read Right Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Left Channel": {
+      "main": [
+        [
+          {
+            "node": "OpenAI - Transcribe left",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI - Transcribe left": {
+      "main": [
+        [
+          {
+            "node": "Prepare Left Transcript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Left Transcript": {
+      "main": [
+        [
+          {
+            "node": "Merge Left + Right",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Right Channel": {
+      "main": [
+        [
+          {
+            "node": "OpenAI - Transcribe right",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI - Transcribe right": {
+      "main": [
+        [
+          {
+            "node": "Prepare Right Transcript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Right Transcript": {
+      "main": [
+        [
+          {
+            "node": "Merge Left + Right",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Left + Right": {
+      "main": [
+        [
+          {
+            "node": "Build Analysis Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Analysis Request": {
+      "main": [
+        [
+          {
+            "node": "gpt-5-mini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "gpt-5-mini": {
+      "main": [
+        [
+          {
+            "node": "Prepare Apps Script Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Apps Script Callback": {
+      "main": [
+        [
+          {
+            "node": "Callback to Apps Script",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Callback to Apps Script": {
+      "main": [
+        [
+          {
+            "node": "Cleanup Temp Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "0ac9a1d8e7b09fb0f504f7d90e7ec36636be03ea59af94bfa8326a51562dd3c5"
+  }
+}

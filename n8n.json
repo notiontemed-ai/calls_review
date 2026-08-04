@@ -4,6 +4,8 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "mango-call-transcribe-stereo-safe-v2",
+        "responseMode": "onReceived",
+        "responseData": "{\"status\":\"accepted\"}",
         "options": {}
       },
       "id": "4d2e0cd5-7979-46da-86b4-828ed702371a",
@@ -14,11 +16,12 @@
         -2336,
         -128
       ],
-      "webhookId": "07b9d2b9-1ee8-465d-912c-8abba49d68db"
+      "webhookId": "07b9d2b9-1ee8-465d-912c-8abba49d68db",
+      "notes": "Отвечает 200 сразу при приёме (respond immediately). Apps Script не ждёт окончания обработки: статус SENT означает «принято в обработку», факт результата виден по колонке transcription_received_at."
     },
     {
       "parameters": {
-        "jsCode": "const input = $input.first().json;\nconst body = input.body || input;\n\nif (body.action !== 'transcribe_and_analyze_call') {\n  throw new Error(`Unknown action: ${body.action}`);\n}\n\nif (!body.call_key) throw new Error('Missing call_key');\nif (!body.drive_file_id) throw new Error('Missing drive_file_id');\n\nif (!body.callback?.url || !body.callback?.secret) {\n  throw new Error('Missing callback.url or callback.secret');\n}\n\nif (!body.prompts?.transcription_prompt) {\n  throw new Error('Missing prompts.transcription_prompt');\n}\n\nif (!Array.isArray(body.prompts?.evaluation_rules) || body.prompts.evaluation_rules.length === 0) {\n  throw new Error('Missing prompts.evaluation_rules');\n}\n\nconst tempId = `mango_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;\n\nreturn [\n  {\n    json: {\n      action: body.action,\n\n      call_key: body.call_key,\n      filename_fixed: body.filename_fixed || '',\n\n      call_datetime: body.call_datetime || '',\n      call_date: body.call_date || '',\n      call_time: body.call_time || '',\n\n      direction: body.direction || '',\n      client_phone: body.client_phone || '',\n      mango_side: body.mango_side || '',\n      line_name: body.line_name || '',\n      operator_name: body.operator_name || '',\n\n      drive_file_id: body.drive_file_id,\n      drive_url: body.drive_url || '',\n\n      prompt_version: body.prompt_version || body.prompts.prompt_version || '',\n\n      prompts: {\n        prompt_version: body.prompts.prompt_version || body.prompt_version || '',\n        transcription_prompt: body.prompts.transcription_prompt || '',\n        analysis_system_prompt: body.prompts.analysis_system_prompt || '',\n        output_schema: body.prompts.output_schema || '',\n        evaluation_rules: body.prompts.evaluation_rules\n      },\n\n      callback: {\n        url: body.callback.url,\n        secret: body.callback.secret\n      },\n\n      temp: {\n        id: tempId,\n        inputPath: `/tmp/${tempId}.mp3`,\n        leftPath: `/tmp/${tempId}_left.wav`,\n        rightPath: `/tmp/${tempId}_right.wav`,\n        splitLogPath: `/tmp/${tempId}_split.log`\n      }\n    }\n  }\n];"
+        "jsCode": "const input = $input.first().json;\nconst body = input.body || input;\n\n// Колонки результата. Список ОБЩИЙ со скриптом Apps Script:\n// он обязан совпадать 1:1 с константой RESULT_HEADERS в файле `code`.\n// Дальше по цепочке список едет в meta.result_fields, поэтому нода\n// Prepare Sheet Update берёт его отсюда и своей копии не держит.\nconst RESULT_FIELDS = [\n  'transcription_received_at',\n  'transcription_error',\n  'transcript_text',\n  'transcript_left',\n  'transcript_right',\n  'summary',\n  'overall_score',\n  'problem_level',\n  'is_problem_call',\n  'main_strength',\n  'main_error',\n  'recommended_feedback',\n  'rule_results_json',\n  'prompt_version',\n  'transcription_n8n_execution_id'\n];\n\nif (body.action !== 'transcribe_and_analyze_call') {\n  throw new Error(`Unknown action: ${body.action}`);\n}\n\nif (!body.call_key) throw new Error('Missing call_key');\nif (!body.drive_file_id) throw new Error('Missing drive_file_id');\n\n// Координаты записи результата: результат пишется прямо в Google Sheets,\n// callback в Apps Script больше не используется.\nif (!body.spreadsheet_id) throw new Error('Missing spreadsheet_id');\nif (!body.sheet_name) throw new Error('Missing sheet_name');\n\nconst rowNumber = Number(body.row_number);\n\nif (!Number.isInteger(rowNumber) || rowNumber < 2) {\n  throw new Error(`Invalid row_number: ${body.row_number} (expected integer >= 2)`);\n}\n\nconst resultColumns = body.result_columns;\n\nif (!resultColumns || typeof resultColumns !== 'object' || Array.isArray(resultColumns)) {\n  throw new Error('Missing result_columns object');\n}\n\nconst normalizedColumns = {};\nconst missingColumns = [];\nconst invalidColumns = [];\n\nfor (const field of RESULT_FIELDS) {\n  const letter = String(resultColumns[field] ?? '').trim().toUpperCase();\n\n  if (!letter) {\n    missingColumns.push(field);\n    continue;\n  }\n\n  if (!/^[A-Z]{1,3}$/.test(letter)) {\n    invalidColumns.push(`${field}=${resultColumns[field]}`);\n    continue;\n  }\n\n  normalizedColumns[field] = letter;\n}\n\nif (missingColumns.length) {\n  throw new Error(`Missing result_columns for: ${missingColumns.join(', ')}`);\n}\n\nif (invalidColumns.length) {\n  throw new Error(`Invalid column letters in result_columns: ${invalidColumns.join(', ')}`);\n}\n\nif (!body.prompts?.transcription_prompt) {\n  throw new Error('Missing prompts.transcription_prompt');\n}\n\nif (!Array.isArray(body.prompts?.evaluation_rules) || body.prompts.evaluation_rules.length === 0) {\n  throw new Error('Missing prompts.evaluation_rules');\n}\n\nconst tempId = `mango_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;\n\nreturn [\n  {\n    json: {\n      action: body.action,\n\n      call_key: body.call_key,\n      filename_fixed: body.filename_fixed || '',\n\n      call_datetime: body.call_datetime || '',\n      call_date: body.call_date || '',\n      call_time: body.call_time || '',\n\n      direction: body.direction || '',\n      client_phone: body.client_phone || '',\n      mango_side: body.mango_side || '',\n      line_name: body.line_name || '',\n      operator_name: body.operator_name || '',\n\n      drive_file_id: body.drive_file_id,\n      drive_url: body.drive_url || '',\n\n      spreadsheet_id: body.spreadsheet_id,\n      sheet_name: body.sheet_name,\n      row_number: rowNumber,\n      result_columns: normalizedColumns,\n      result_fields: RESULT_FIELDS,\n\n      prompt_version: body.prompt_version || body.prompts.prompt_version || '',\n\n      prompts: {\n        prompt_version: body.prompts.prompt_version || body.prompt_version || '',\n        transcription_prompt: body.prompts.transcription_prompt || '',\n        analysis_system_prompt: body.prompts.analysis_system_prompt || '',\n        output_schema: body.prompts.output_schema || '',\n        evaluation_rules: body.prompts.evaluation_rules\n      },\n\n      temp: {\n        id: tempId,\n        inputPath: `/tmp/${tempId}.mp3`,\n        leftPath: `/tmp/${tempId}_left.wav`,\n        rightPath: `/tmp/${tempId}_right.wav`,\n        splitLogPath: `/tmp/${tempId}_split.log`\n      }\n    }\n  }\n];\n"
       },
       "id": "fd50e9c0-b4a8-4c48-be94-76c252be1621",
       "name": "Normalize Incoming Payload",
@@ -48,7 +51,8 @@
       "position": [
         -1856,
         -128
-      ]
+      ],
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -61,7 +65,8 @@
       "position": [
         -1616,
         -128
-      ]
+      ],
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -76,7 +81,8 @@
       "position": [
         -1376,
         -128
-      ]
+      ],
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -89,7 +95,8 @@
       "position": [
         -1136,
         -128
-      ]
+      ],
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -102,7 +109,8 @@
       "position": [
         -896,
         -128
-      ]
+      ],
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -116,7 +124,8 @@
       "position": [
         -656,
         -304
-      ]
+      ],
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -140,7 +149,8 @@
           "id": "AYsswqQnu0370Vfk",
           "name": "OpenAi [ temed | cid ]"
         }
-      }
+      },
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -153,7 +163,8 @@
       "position": [
         -176,
         -304
-      ]
+      ],
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -167,7 +178,8 @@
       "position": [
         -656,
         64
-      ]
+      ],
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -191,7 +203,8 @@
           "id": "AYsswqQnu0370Vfk",
           "name": "OpenAi [ temed | cid ]"
         }
-      }
+      },
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -204,7 +217,8 @@
       "position": [
         -176,
         64
-      ]
+      ],
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -232,7 +246,8 @@
       "position": [
         352,
         -128
-      ]
+      ],
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -267,42 +282,82 @@
           "id": "AYsswqQnu0370Vfk",
           "name": "OpenAi [ temed | cid ]"
         }
-      }
+      },
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "const current = $input.first().json;\nconst meta = $items('Build Analysis Request')[0].json;\n\nconst raw =\n  current.message?.content ||\n  current.choices?.[0]?.message?.content ||\n  current.output ||\n  current.text ||\n  current.response ||\n  current.data ||\n  '';\n\nfunction parseJsonSafe(value) {\n  if (typeof value === 'object' && value !== null) return value;\n\n  const s = String(value || '').trim();\n  if (!s) return null;\n\n  try { return JSON.parse(s); } catch (e) {}\n\n  const cleaned = s\n    .replace(/^```json/i, '')\n    .replace(/^```/i, '')\n    .replace(/```$/i, '')\n    .trim();\n\n  try { return JSON.parse(cleaned); } catch (e) {}\n\n  const first = cleaned.indexOf('{');\n  const last = cleaned.lastIndexOf('}');\n\n  if (first !== -1 && last !== -1 && last > first) {\n    try { return JSON.parse(cleaned.slice(first, last + 1)); } catch (e) {}\n  }\n\n  return null;\n}\n\nfunction normalizeProblemLevel(value) {\n  const allowed = ['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];\n  const s = String(value || '').trim().toUpperCase();\n  return allowed.includes(s) ? s : 'NONE';\n}\n\nfunction normalizeBoolean(value) {\n  if (value === true) return true;\n  if (value === false) return false;\n\n  const s = String(value || '').trim().toLowerCase();\n  if (['true', '1', 'yes', 'да', 'истина'].includes(s)) return true;\n  if (['false', '0', 'no', 'нет', 'ложь'].includes(s)) return false;\n\n  return false;\n}\n\nfunction normalizeScore(value) {\n  if (value === null || value === undefined || value === '') return null;\n  const n = Number(value);\n  if (!Number.isFinite(n)) return null;\n  if (n < 1) return 1;\n  if (n > 5) return 5;\n  return n;\n}\n\nfunction asArray(value) {\n  return Array.isArray(value) ? value : [];\n}\n\nlet analysis = parseJsonSafe(raw);\n\nif (!analysis) {\n  analysis = {\n    summary: '',\n    overall_score: null,\n    problem_level: 'HIGH',\n    is_problem_call: true,\n    channel_roles: {\n      left: 'unknown',\n      right: 'unknown',\n      confidence: 'low',\n      reason: 'AI вернул невалидный JSON'\n    },\n    main_strength: '',\n    main_error: 'AI вернул невалидный JSON',\n    recommended_feedback: 'Проверить звонок вручную.',\n    rule_results: [],\n    raw_ai_response: String(raw || '')\n  };\n}\n\nanalysis = {\n  summary: String(analysis.summary || ''),\n  overall_score: normalizeScore(analysis.overall_score),\n  problem_level: normalizeProblemLevel(analysis.problem_level),\n  is_problem_call: normalizeBoolean(analysis.is_problem_call),\n  channel_roles: analysis.channel_roles || {\n    left: 'unknown',\n    right: 'unknown',\n    confidence: 'low',\n    reason: ''\n  },\n  main_strength: String(analysis.main_strength || ''),\n  main_error: String(analysis.main_error || ''),\n  recommended_feedback: String(analysis.recommended_feedback || ''),\n  rule_results: asArray(analysis.rule_results)\n    .map(r => ({\n      rule_id: String(r.rule_id || ''),\n      score: normalizeScore(r.score),\n      is_na: normalizeBoolean(r.is_na),\n      reason: String(r.reason || ''),\n      evidence: String(r.evidence || ''),\n      recommendation: String(r.recommendation || '')\n    }))\n    .filter(r => r.rule_id)\n};\n\nreturn [\n  {\n    json: {\n      callbackUrl: String(meta.callback.url || '').trim(),\n      callbackBody: {\n        action: 'n8n_call_result',\n        secret: meta.callback.secret,\n        call_key: meta.call_key,\n        prompt_version: meta.prompt_version || meta.prompts.prompt_version || '',\n        transcript_text: meta.transcript_text,\n        transcript_channels: meta.transcript_channels,\n        analysis\n      },\n      temp: meta.temp\n    }\n  }\n];"
+        "jsCode": "const current = $input.first().json;\nconst meta = $items('Build Analysis Request')[0].json;\n\nconst raw =\n  current.message?.content ||\n  current.choices?.[0]?.message?.content ||\n  current.output ||\n  current.text ||\n  current.response ||\n  current.data ||\n  '';\n\nfunction parseJsonSafe(value) {\n  if (typeof value === 'object' && value !== null) return value;\n\n  const s = String(value || '').trim();\n  if (!s) return null;\n\n  try { return JSON.parse(s); } catch (e) {}\n\n  const cleaned = s\n    .replace(/^```json/i, '')\n    .replace(/^```/i, '')\n    .replace(/```$/i, '')\n    .trim();\n\n  try { return JSON.parse(cleaned); } catch (e) {}\n\n  const first = cleaned.indexOf('{');\n  const last = cleaned.lastIndexOf('}');\n\n  if (first !== -1 && last !== -1 && last > first) {\n    try { return JSON.parse(cleaned.slice(first, last + 1)); } catch (e) {}\n  }\n\n  return null;\n}\n\nfunction normalizeProblemLevel(value) {\n  const allowed = ['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];\n  const s = String(value || '').trim().toUpperCase();\n  return allowed.includes(s) ? s : 'NONE';\n}\n\nfunction normalizeBoolean(value) {\n  if (value === true) return true;\n  if (value === false) return false;\n\n  const s = String(value || '').trim().toLowerCase();\n  if (['true', '1', 'yes', 'да', 'истина'].includes(s)) return true;\n  if (['false', '0', 'no', 'нет', 'ложь'].includes(s)) return false;\n\n  return false;\n}\n\nfunction normalizeScore(value) {\n  if (value === null || value === undefined || value === '') return null;\n  const n = Number(value);\n  if (!Number.isFinite(n)) return null;\n  if (n < 1) return 1;\n  if (n > 5) return 5;\n  return n;\n}\n\nfunction asArray(value) {\n  return Array.isArray(value) ? value : [];\n}\n\nlet analysis = parseJsonSafe(raw);\n\nif (!analysis) {\n  analysis = {\n    summary: '',\n    overall_score: null,\n    problem_level: 'HIGH',\n    is_problem_call: true,\n    channel_roles: {\n      left: 'unknown',\n      right: 'unknown',\n      confidence: 'low',\n      reason: 'AI вернул невалидный JSON'\n    },\n    main_strength: '',\n    main_error: 'AI вернул невалидный JSON',\n    recommended_feedback: 'Проверить звонок вручную.',\n    rule_results: [],\n    raw_ai_response: String(raw || '')\n  };\n}\n\nanalysis = {\n  summary: String(analysis.summary || ''),\n  overall_score: normalizeScore(analysis.overall_score),\n  problem_level: normalizeProblemLevel(analysis.problem_level),\n  is_problem_call: normalizeBoolean(analysis.is_problem_call),\n  channel_roles: analysis.channel_roles || {\n    left: 'unknown',\n    right: 'unknown',\n    confidence: 'low',\n    reason: ''\n  },\n  main_strength: String(analysis.main_strength || ''),\n  main_error: String(analysis.main_error || ''),\n  recommended_feedback: String(analysis.recommended_feedback || ''),\n  rule_results: asArray(analysis.rule_results)\n    .map(r => ({\n      rule_id: String(r.rule_id || ''),\n      score: normalizeScore(r.score),\n      is_na: normalizeBoolean(r.is_na),\n      reason: String(r.reason || ''),\n      evidence: String(r.evidence || ''),\n      recommendation: String(r.recommendation || '')\n    }))\n    .filter(r => r.rule_id)\n};\n\n// --- Подготовка записи в Google Sheets --------------------------------\n// Имя листа в A1-нотации всегда берём в одинарные кавычки: в нём есть\n// пробелы и кириллица («Записи звонков»).\nfunction quoteSheetName(name) {\n  return `'${String(name || '').replace(/'/g, \"''\")}'`;\n}\n\n// Лимит одной ячейки Google Sheets — 50 000 символов.\nconst MAX_CELL_LENGTH = 45000;\n\nfunction cellText(value) {\n  const s = String(value === null || value === undefined ? '' : value);\n  return s.length > MAX_CELL_LENGTH\n    ? `${s.slice(0, MAX_CELL_LENGTH)}…[обрезано]`\n    : s;\n}\n\nconst receivedAt = $now.toFormat('yyyy-MM-dd HH:mm:ss');\n\nconst values = {\n  transcription_received_at: receivedAt,\n  transcription_error: '',\n  transcript_text: cellText(meta.transcript_text),\n  transcript_left: cellText(meta.transcript_channels?.left),\n  transcript_right: cellText(meta.transcript_channels?.right),\n  summary: cellText(analysis.summary),\n  overall_score: analysis.overall_score === null ? '' : analysis.overall_score,\n  problem_level: analysis.problem_level,\n  is_problem_call: analysis.is_problem_call ? 'TRUE' : 'FALSE',\n  main_strength: cellText(analysis.main_strength),\n  main_error: cellText(analysis.main_error),\n  recommended_feedback: cellText(analysis.recommended_feedback),\n  rule_results_json: cellText(JSON.stringify(analysis.rule_results)),\n  prompt_version: meta.prompt_version || meta.prompts?.prompt_version || '',\n  transcription_n8n_execution_id: String($execution.id)\n};\n\nconst fields = Array.isArray(meta.result_fields) && meta.result_fields.length\n  ? meta.result_fields\n  : Object.keys(values);\n\nconst withoutValue = fields.filter(f => values[f] === undefined);\n\nif (withoutValue.length) {\n  throw new Error(`No value prepared for result fields: ${withoutValue.join(', ')}`);\n}\n\nconst withoutColumn = fields.filter(f => !meta.result_columns?.[f]);\n\nif (withoutColumn.length) {\n  throw new Error(`No column letter for result fields: ${withoutColumn.join(', ')}`);\n}\n\nconst sheetPrefix = quoteSheetName(meta.sheet_name);\n\nconst sheetUpdates = fields.map(field => ({\n  field,\n  range: `${sheetPrefix}!${meta.result_columns[field]}${meta.row_number}`,\n  value: values[field]\n}));\n\nreturn [\n  {\n    json: {\n      call_key: meta.call_key,\n\n      spreadsheet_id: meta.spreadsheet_id,\n      sheet_name: meta.sheet_name,\n      row_number: meta.row_number,\n\n      sheetUpdates,\n\n      // Одним запросом: values:batchUpdate вместо записи по одной ячейке.\n      batchBody: {\n        valueInputOption: 'RAW',\n        data: sheetUpdates.map(u => ({ range: u.range, values: [[u.value]] }))\n      },\n\n      analysis,\n      temp: meta.temp\n    }\n  }\n];\n"
       },
       "id": "519e7824-fb6c-4fab-9212-a45fed716045",
-      "name": "Prepare Apps Script Callback",
+      "name": "Prepare Sheet Update",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
         880,
         -128
-      ]
+      ],
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ String($json.callbackUrl || '').trim() }}",
+        "url": "=https://sheets.googleapis.com/v4/spreadsheets/{{ $json.spreadsheet_id }}/values:batchUpdate",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ $json.callbackBody }}",
+        "jsonBody": "={{ JSON.stringify($json.batchBody) }}",
         "options": {}
       },
       "id": "a495d952-ec02-4858-9423-47a1db8d58f2",
-      "name": "Callback to Apps Script",
+      "name": "Write Result To Sheet",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
         1136,
         -128
-      ]
+      ],
+      "notes": "Один запрос values:batchUpdate на всю строку результата. Credential: Google с доступом к Sheets (scope https://www.googleapis.com/auth/spreadsheets). Если используется сервисный аккаунт (тот же, что для Google Drive) — выберите Predefined Credential Type = Google API и добавьте этот scope в credential; сервисному аккаунту нужен доступ на редактирование самой таблицы."
     },
     {
       "parameters": {
-        "command": "=rm -f '{{ $items(\"Prepare Apps Script Callback\")[0].json.temp.inputPath }}' '{{ $items(\"Prepare Apps Script Callback\")[0].json.temp.leftPath }}' '{{ $items(\"Prepare Apps Script Callback\")[0].json.temp.rightPath }}' '{{ $items(\"Prepare Apps Script Callback\")[0].json.temp.splitLogPath }}'"
+        "jsCode": "// Общая ветка ошибок: сюда приходит error-выход любой ноды обработки.\n// Пишем только transcription_error и transcription_received_at —\n// остальные колонки строки не трогаем.\nconst meta = $items('Normalize Incoming Payload')[0].json;\nconst item = $input.first();\nconst json = item.json || {};\n\nconst rawError = json.error !== undefined ? json.error : json;\n\nfunction errorText(value) {\n  if (!value) return 'Unknown error';\n  if (typeof value === 'string') return value;\n\n  const parts = [];\n\n  if (value.message) parts.push(String(value.message));\n  if (value.description && value.description !== value.message) {\n    parts.push(String(value.description));\n  }\n\n  if (parts.length) return parts.join(' — ');\n\n  try {\n    return JSON.stringify(value).slice(0, 1500);\n  } catch (e) {\n    return String(value);\n  }\n}\n\nconst failedNode =\n  json.error?.node?.name ||\n  json.node?.name ||\n  json.lastNodeExecuted ||\n  '';\n\nconst message = [\n  `n8n execution ${$execution.id}`,\n  failedNode ? `нода «${failedNode}»` : '',\n  errorText(rawError)\n].filter(Boolean).join(': ');\n\nfunction quoteSheetName(name) {\n  return `'${String(name || '').replace(/'/g, \"''\")}'`;\n}\n\nconst MAX_CELL_LENGTH = 45000;\n\nconst values = {\n  transcription_error: message.length > MAX_CELL_LENGTH\n    ? `${message.slice(0, MAX_CELL_LENGTH)}…[обрезано]`\n    : message,\n  transcription_received_at: $now.toFormat('yyyy-MM-dd HH:mm:ss')\n};\n\nconst sheetPrefix = quoteSheetName(meta.sheet_name);\n\nconst sheetUpdates = Object.keys(values)\n  .filter(field => meta.result_columns?.[field])\n  .map(field => ({\n    field,\n    range: `${sheetPrefix}!${meta.result_columns[field]}${meta.row_number}`,\n    value: values[field]\n  }));\n\nif (!sheetUpdates.length) {\n  throw new Error('No result_columns for transcription_error / transcription_received_at');\n}\n\nreturn [\n  {\n    json: {\n      call_key: meta.call_key,\n\n      spreadsheet_id: meta.spreadsheet_id,\n      sheet_name: meta.sheet_name,\n      row_number: meta.row_number,\n\n      failed_node: failedNode,\n      error_message: message,\n\n      sheetUpdates,\n\n      batchBody: {\n        valueInputOption: 'RAW',\n        data: sheetUpdates.map(u => ({ range: u.range, values: [[u.value]] }))\n      },\n\n      temp: meta.temp\n    }\n  }\n];\n"
+      },
+      "id": "0a6f1c47-6d2b-4a4c-9a2c-6f5f2c1c9a10",
+      "name": "Prepare Error Update",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        320
+      ],
+      "notes": "Единая ветка ошибок: пишет transcription_error и transcription_received_at в те же координаты строки, остальные колонки не трогает."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://sheets.googleapis.com/v4/spreadsheets/{{ $json.spreadsheet_id }}/values:batchUpdate",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.batchBody) }}",
+        "options": {}
+      },
+      "id": "3c1f0a92-77b0-4a5e-8f0b-2d9a4b7c1e33",
+      "name": "Write Error To Sheet",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1136,
+        320
+      ],
+      "notes": "Один запрос values:batchUpdate на всю строку результата. Credential: Google с доступом к Sheets (scope https://www.googleapis.com/auth/spreadsheets). Если используется сервисный аккаунт (тот же, что для Google Drive) — выберите Predefined Credential Type = Google API и добавьте этот scope в credential; сервисному аккаунту нужен доступ на редактирование самой таблицы."
+    },
+    {
+      "parameters": {
+        "command": "=rm -f '{{ $items(\"Normalize Incoming Payload\")[0].json.temp.inputPath }}' '{{ $items(\"Normalize Incoming Payload\")[0].json.temp.leftPath }}' '{{ $items(\"Normalize Incoming Payload\")[0].json.temp.rightPath }}' '{{ $items(\"Normalize Incoming Payload\")[0].json.temp.splitLogPath }}'"
       },
       "id": "8ecf4209-e9b8-476d-b8dc-387921abe46e",
       "name": "Cleanup Temp Files",
@@ -311,7 +366,9 @@
       "position": [
         1392,
         -128
-      ]
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Выполняется и при успехе, и в ветке ошибки. Пути берутся из Normalize Incoming Payload — эта нода отрабатывает всегда."
     }
   ],
   "connections": {
@@ -345,6 +402,13 @@
             "type": "main",
             "index": 0
           }
+        ],
+        [
+          {
+            "node": "Prepare Error Update",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     },
@@ -353,6 +417,13 @@
         [
           {
             "node": "Write Source Audio To Disk",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Error Update",
             "type": "main",
             "index": 0
           }
@@ -367,6 +438,13 @@
             "type": "main",
             "index": 0
           }
+        ],
+        [
+          {
+            "node": "Prepare Error Update",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     },
@@ -375,6 +453,13 @@
         [
           {
             "node": "FFmpeg Split Channels",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Error Update",
             "type": "main",
             "index": 0
           }
@@ -394,6 +479,13 @@
             "type": "main",
             "index": 0
           }
+        ],
+        [
+          {
+            "node": "Prepare Error Update",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     },
@@ -402,6 +494,13 @@
         [
           {
             "node": "OpenAI - Transcribe left",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Error Update",
             "type": "main",
             "index": 0
           }
@@ -416,6 +515,13 @@
             "type": "main",
             "index": 0
           }
+        ],
+        [
+          {
+            "node": "Prepare Error Update",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     },
@@ -424,6 +530,13 @@
         [
           {
             "node": "Merge Left + Right",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Error Update",
             "type": "main",
             "index": 0
           }
@@ -438,6 +551,13 @@
             "type": "main",
             "index": 0
           }
+        ],
+        [
+          {
+            "node": "Prepare Error Update",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     },
@@ -446,6 +566,13 @@
         [
           {
             "node": "Prepare Right Transcript",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Error Update",
             "type": "main",
             "index": 0
           }
@@ -459,6 +586,13 @@
             "node": "Merge Left + Right",
             "type": "main",
             "index": 1
+          }
+        ],
+        [
+          {
+            "node": "Prepare Error Update",
+            "type": "main",
+            "index": 0
           }
         ]
       ]
@@ -482,6 +616,13 @@
             "type": "main",
             "index": 0
           }
+        ],
+        [
+          {
+            "node": "Prepare Error Update",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     },
@@ -489,25 +630,61 @@
       "main": [
         [
           {
-            "node": "Prepare Apps Script Callback",
+            "node": "Prepare Sheet Update",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Error Update",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Prepare Apps Script Callback": {
+    "Prepare Sheet Update": {
       "main": [
         [
           {
-            "node": "Callback to Apps Script",
+            "node": "Write Result To Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Error Update",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Callback to Apps Script": {
+    "Write Result To Sheet": {
+      "main": [
+        [
+          {
+            "node": "Cleanup Temp Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Error Update": {
+      "main": [
+        [
+          {
+            "node": "Write Error To Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Error To Sheet": {
       "main": [
         [
           {

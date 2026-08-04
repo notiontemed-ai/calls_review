@@ -352,15 +352,22 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
   const logSheet = getOrCreateLogSheet_();
 
   const push = function(step, file, details) {
+    const stepName = String(step || '');
+
     try {
       logSheet.appendRow([
         nowString_(),
         runId,
-        String(step || ''),
+        stepName,
         String(file || '').slice(0, 300),
         String(details || '').slice(0, 2000)
       ]);
-      SpreadsheetApp.flush();
+
+      // flush() дорогой: делаем его только на ключевых шагах, чтобы
+      // строка гарантированно осталась на листе, если запуск оборвётся.
+      if (FLUSH_LOG_STEPS.indexOf(stepName) !== -1) {
+        SpreadsheetApp.flush();
+      }
     } catch (e) {
       Logger.log('Не удалось записать лог: ' + e);
     }
@@ -371,13 +378,9 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
       'START',
       '',
       'Запуск отправки в n8n. URL: ' + String(CONFIG.N8N_WEBHOOK_URL) +
-        ', лимит запуска: ' + limitText
-    );
-
-    push(
-      'SECRET',
-      '',
-      'Заголовок: ' + CONFIG.N8N_SECRET_HEADER + ', значение: ' + maskSecret_(CONFIG.N8N_SECRET)
+        ', лимит запуска: ' + limitText +
+        ', лист: ' + CONFIG.SHEET_NAME +
+        ', заголовок ' + CONFIG.N8N_SECRET_HEADER + ': ' + maskSecret_(CONFIG.N8N_SECRET)
     );
 
     getWebhookUrl_();
@@ -388,14 +391,12 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
     const headerMap = getHeaderMap_(sheet);
     const lastRow = sheet.getLastRow();
 
-    push('SHEET', '', 'Лист: ' + CONFIG.SHEET_NAME + ', строк с данными: ' + Math.max(0, lastRow - 1));
-
     if (lastRow < 2) {
       const emptyMessage = 'НЕТ СТРОК ДЛЯ ОТПРАВКИ. На листе «' + CONFIG.SHEET_NAME +
         '» нет ни одной строки с данными. Запустите «Обновить список записей».';
 
       push('NO_CANDIDATES', '', emptyMessage);
-      push('FINISH', '', emptyMessage);
+      push('FINISH', '', emptyMessage + ' Время: ' + (Date.now() - runStartedAt) + ' мс.');
       SpreadsheetApp.getActive().toast('Нет строк для отправки.');
       showAlert_('Отправка в n8n', emptyMessage);
       return;
@@ -405,18 +406,16 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
       .getRange(2, 1, lastRow - 1, sheet.getLastColumn())
       .getValues();
 
-    const stats = analyzeSendCandidates_(values, headerMap);
+    // ФАЗА 1 — отбор кандидатов в памяти, без записи в лог.
+    // Причины пропуска только считаются: построчный ROW_SKIP при сотнях
+    // уже отправленных строк засорял «Лог» и растягивал запуск на минуты.
+    const selection = collectSendCandidates_(values, headerMap, sendLimit);
+    const skipSummary = describeSkipCounters_(selection);
 
-    push(
-      'CANDIDATES',
-      '',
-      'Всего строк с данными: ' + stats.totalRows +
-        ', кандидатов на отправку (проходят фильтр «ещё не отправлено»): ' + stats.candidates +
-        ', лимит запуска: ' + limitText
-    );
-
-    if (stats.candidates === 0) {
-      const noCandidatesMessage = describeNoCandidates_(stats);
+    if (selection.candidates.length === 0) {
+      const noCandidatesMessage = 'НЕТ СТРОК ДЛЯ ОТПРАВКИ. Просмотрено строк: ' +
+        selection.scannedRows + ' (лимит запуска: ' + limitText + '); пропущено: ' + skipSummary +
+        '. Запрос в n8n не отправлялся — отправлять нечего.';
 
       push('NO_CANDIDATES', '', noCandidatesMessage);
       push('FINISH', '', noCandidatesMessage + ' Время: ' + (Date.now() - runStartedAt) + ' мс.');
@@ -425,32 +424,31 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
       return;
     }
 
+    push(
+      'CANDIDATES',
+      '',
+      'CANDIDATES: найдено ' + selection.candidates.length +
+        ' (лимит ' + limitText + ') из ' + selection.scannedRows + ' строк' +
+        (selection.scannedRows < selection.totalRows
+          ? ' (всего на листе ' + selection.totalRows + ', отбор прерван по лимиту)'
+          : '') +
+        '; пропущено: ' + skipSummary
+    );
+
+    // ФАЗА 2 — отправка: цикл только по отобранным кандидатам.
     let sent = 0;
-    let skipped = 0;
     let errors = 0;
     let aborted = false;
 
-    for (let i = 0; i < values.length; i++) {
-      if (sendLimit !== null && sent >= sendLimit) {
-        push('LIMIT', '', 'Достигнут лимит отправки за запуск: ' + sendLimit);
-        break;
-      }
-
-      const rowNumber = i + 2;
-      const row = values[i];
+    for (let i = 0; i < selection.candidates.length; i++) {
+      const candidate = selection.candidates[i];
+      const rowNumber = candidate.rowNumber;
+      const row = candidate.row;
       const callKey = getCellByHeader_(row, headerMap, 'call_key');
-
-      const transcriptionError = getCellByHeader_(row, headerMap, 'transcription_error');
 
       // Строки со статусом ERROR НЕ пропускаются — повторяем отправку,
       // старая ошибка в transcription_error затирается при успехе.
-      const skipReason = getSendSkipReason_(row, headerMap);
-
-      if (skipReason) {
-        skipped++;
-        push('ROW_SKIP', callKey || ('строка ' + rowNumber), 'Строка ' + rowNumber + ': ' + skipReason);
-        continue;
-      }
+      const transcriptionError = getCellByHeader_(row, headerMap, 'transcription_error');
 
       if (transcriptionError) {
         push('ROW_RETRY', callKey, 'Строка ' + rowNumber + ': повтор после ошибки: ' + transcriptionError.slice(0, 200));
@@ -484,7 +482,7 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
     const message =
       'Отправлено: ' + sent +
       ', ошибок: ' + errors +
-      ', пропущено: ' + skipped +
+      ', пропущено: ' + selection.skippedTotal +
       ', время: ' + durationMs + ' мс' +
       ', лимит: ' + limitText +
       (aborted ? ' (прервано: n8n недоступен)' : '');
@@ -620,7 +618,7 @@ function sendTranscriptionRow_(sheet, rowNumber, row, headerMap, push) {
   const durationMs = Date.now() - startedAt;
   const statusCode = response.getResponseCode();
   const responseText = response.getContentText();
-  const hint = httpStatusHint_(statusCode);
+  const hint = httpStatusHint_(statusCode, webhookUrl);
 
   log(
     'RESPONSE',
@@ -710,14 +708,48 @@ function shortResponseText_(text) {
 }
 
 /**
+ * Не-ASCII символы в пути URL. Частая причина 404: в адрес попала
+ * кириллическая буква, визуально неотличимая от латинской («с» vs «c»).
+ * Возвращает список вида «с» (позиция 12, U+0441) — пустой, если всё чисто.
+ */
+function findNonAsciiInUrlPath_(url) {
+  const source = String(url || '');
+
+  // Хост из проверки исключаем: в нём не-ASCII — это легальный IDN.
+  const withoutScheme = source.replace(/^[a-z][a-z0-9+.\-]*:\/\//i, '');
+  const slashAt = withoutScheme.indexOf('/');
+
+  if (slashAt === -1) return [];
+
+  const path = withoutScheme.slice(slashAt).split('?')[0].split('#')[0];
+  const found = [];
+
+  for (let i = 0; i < path.length; i++) {
+    const code = path.charCodeAt(i);
+
+    if (code > 127) {
+      const hex = code.toString(16).toUpperCase();
+      found.push('«' + path[i] + '» (позиция ' + (i + 1) + ', U+' + ('0000' + hex).slice(-4) + ')');
+    }
+  }
+
+  return found;
+}
+
+/**
  * Подсказка по HTTP-статусу: известные причины «нет executions».
  */
-function httpStatusHint_(statusCode) {
+function httpStatusHint_(statusCode, url) {
   const code = Number(statusCode);
 
   if (code === 404) {
+    const nonAscii = findNonAsciiInUrlPath_(url);
+
     return 'ПОДСКАЗКА: вебхук не найден: workflow неактивен или URL не production ' +
-           '(проверьте /webhook/ vs /webhook-test/)';
+           '(проверьте /webhook/ vs /webhook-test/)' +
+           (nonAscii.length > 0
+             ? '. ВНИМАНИЕ: в пути вебхука есть не-ASCII символы: ' + nonAscii.join(', ')
+             : '');
   }
 
   if (code === 401 || code === 403) {
@@ -736,69 +768,91 @@ function httpStatusHint_(statusCode) {
 }
 
 /**
- * Причина пропуска строки при отправке. Ровно те же условия, что
- * и раньше в цикле отправки, — вынесены в функцию, чтобы предварительный
- * подсчёт кандидатов и сама отправка не могли разойтись.
+ * Шаги, после которых лог сбрасывается на лист немедленно.
+ * На остальных строках flush() пропускается: он дорогой, а при сотнях
+ * строк лога именно он и растягивал запуск на минуты.
  */
-function getSendSkipReason_(row, headerMap) {
+const FLUSH_LOG_STEPS = [
+  'START',
+  'CANDIDATES',
+  'NO_CANDIDATES',
+  'ROW_SEND',
+  'ROW_ERROR',
+  'ABORT',
+  'FINISH',
+  'FATAL'
+];
+
+/**
+ * Код причины пропуска строки при отправке ('' — строка-кандидат).
+ * Ровно те же условия, что и раньше в цикле отправки, — вынесены в
+ * функцию, чтобы отбор кандидатов и сама отправка не могли разойтись.
+ */
+function getSendSkipCode_(row, headerMap) {
   const driveFileId = getCellByHeader_(row, headerMap, 'drive_file_id');
   const parseError = getCellByHeader_(row, headerMap, 'error_text');
   const sendStatus = getCellByHeader_(row, headerMap, 'transcription_send_status');
   const receivedAt = getCellByHeader_(row, headerMap, 'transcription_received_at');
 
-  if (!driveFileId) return 'нет drive_file_id';
-  if (parseError) return 'есть error_text: ' + parseError;
-  if (sendStatus === 'SENT') return 'уже отправлено (transcription_send_status = SENT)';
-  if (receivedAt) return 'уже есть результат (transcription_received_at заполнено)';
+  if (!driveFileId) return 'NO_DRIVE_FILE_ID';
+  if (parseError) return 'ERROR_TEXT';
+  if (sendStatus === 'SENT') return 'SENT';
+  if (receivedAt) return 'HAS_RESULT';
 
   // Строки со статусом ERROR НЕ пропускаются — повторяем отправку.
   return '';
 }
 
 /**
- * Предварительный разбор листа: сколько строк вообще проходит фильтр
- * «ещё не отправлено» и, если таких нет, — почему.
- * Счётчики причин считаются независимо друг от друга, поэтому их сумма
- * может быть больше числа строк (у одной строки бывает несколько проблем).
+ * Фаза отбора: один проход по значениям листа, без единой записи в лог.
+ * Проход прерывается, как только набрано sendLimit кандидатов, — поэтому
+ * «1 запись» на листе с уже отправленными строками отрабатывает за секунды.
  */
-function analyzeSendCandidates_(values, headerMap) {
-  const stats = {
+function collectSendCandidates_(values, headerMap, sendLimit) {
+  const selection = {
     totalRows: values.length,
-    candidates: 0,
-    alreadySent: 0,
-    alreadyReceived: 0,
-    withParseError: 0,
-    withSendError: 0,
-    noCallKey: 0,
-    noDriveFileId: 0
+    scannedRows: 0,
+    candidates: [],
+    skippedTotal: 0,
+    skipped: {
+      SENT: 0,
+      NO_DRIVE_FILE_ID: 0,
+      ERROR_TEXT: 0,
+      HAS_RESULT: 0
+    }
   };
 
-  values.forEach(function(row) {
-    if (!getSendSkipReason_(row, headerMap)) stats.candidates++;
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
 
-    if (!getCellByHeader_(row, headerMap, 'call_key')) stats.noCallKey++;
-    if (!getCellByHeader_(row, headerMap, 'drive_file_id')) stats.noDriveFileId++;
-    if (getCellByHeader_(row, headerMap, 'error_text')) stats.withParseError++;
-    if (getCellByHeader_(row, headerMap, 'transcription_error')) stats.withSendError++;
-    if (getCellByHeader_(row, headerMap, 'transcription_received_at')) stats.alreadyReceived++;
-    if (getCellByHeader_(row, headerMap, 'transcription_send_status') === 'SENT') stats.alreadySent++;
-  });
+    selection.scannedRows++;
 
-  return stats;
+    const skipCode = getSendSkipCode_(row, headerMap);
+
+    if (skipCode) {
+      selection.skippedTotal++;
+      selection.skipped[skipCode]++;
+      continue;
+    }
+
+    selection.candidates.push({ rowNumber: i + 2, row: row });
+
+    if (sendLimit !== null && selection.candidates.length >= sendLimit) break;
+  }
+
+  return selection;
 }
 
 /**
- * Расшифровка «почему кандидатов ноль» — одной строкой для лога.
+ * Счётчики причин пропуска одной строкой для лога.
  */
-function describeNoCandidates_(stats) {
-  return 'НЕТ СТРОК ДЛЯ ОТПРАВКИ. Всего строк: ' + stats.totalRows +
-    '; со статусом SENT: ' + stats.alreadySent +
-    '; с готовым результатом (transcription_received_at): ' + stats.alreadyReceived +
-    '; с ошибкой разбора (error_text): ' + stats.withParseError +
-    '; с ошибкой прошлой отправки (transcription_error): ' + stats.withSendError +
-    '; без call_key: ' + stats.noCallKey +
-    '; без drive_file_id: ' + stats.noDriveFileId +
-    '. Запрос в n8n не отправлялся — отправлять нечего.';
+function describeSkipCounters_(selection) {
+  const skipped = selection.skipped;
+
+  return 'SENT=' + skipped.SENT +
+    ', нет drive_file_id=' + skipped.NO_DRIVE_FILE_ID +
+    ', error_text=' + skipped.ERROR_TEXT +
+    ', есть результат=' + skipped.HAS_RESULT;
 }
 
 /**
@@ -892,7 +946,7 @@ function pingN8nWebhook() {
 
     const durationMs = Date.now() - startedAt;
     const statusCode = response.getResponseCode();
-    const hint = httpStatusHint_(statusCode);
+    const hint = httpStatusHint_(statusCode, url);
 
     push(
       'PING_RESPONSE',

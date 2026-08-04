@@ -278,6 +278,7 @@ function onOpen() {
     .addItem('Отправить в n8n', 'sendNewCallsToTranscriptionN8n')
     .addSeparator()
     .addItem('Обновить сотрудников из Битрикс', 'refreshEmployeesFromBitrix')
+    .addItem('Пересчитать операторов', 'recalculateOperatorNames')
     .addItem(
       'Создать ежедневный триггер обновления сотрудников',
       'createEmployeesDailyRefreshTrigger'
@@ -303,6 +304,23 @@ function scanMangoRecordingsFolder() {
       String(details || '').slice(0, 2000)
     ]);
   };
+
+  // Тот же scriptLock, что у обновления сотрудников и пересчёта операторов:
+  // лист «Записи звонков» одновременно пишет только один из них.
+  const lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(SHEET_LOCK_TIMEOUT_MS)) {
+    push(
+      'SCAN_LOCKED',
+      '',
+      'Скан/пересчёт/обновление сотрудников уже выполняется (lock не получен за ' +
+        SHEET_LOCK_TIMEOUT_MS + ' мс). Запуск пропущен.'
+    );
+
+    flushLog_(log);
+    showToast_('Сканирование уже выполняется — запуск пропущен.');
+    return;
+  }
 
   try {
     push('START', '', 'Запуск сканирования');
@@ -423,27 +441,14 @@ function scanMangoRecordingsFolder() {
 
           const now = nowString_();
 
-          // Матчинг оператора. Сначала ручной маппинг листа «Операторы»
-          // (он авторитетен), иначе — то, что извлеклось из имени файла.
-          // Подстановка полного ФИО из справочника разрешена только при
-          // надёжном совпадении; иначе в operator_name остаётся исходное
-          // значение, а причина видна в «Логе».
-          const mapped = operatorMapping[normalizeFio_(parsed.mango_side)] || '';
-          const operatorInput = mapped || parsed.operator_name;
-
-          const operatorMatch = matchEmployeeByName_(operatorInput, employees);
-          const operatorMatched = isConfidentEmployeeMatch_(operatorMatch.status);
+          // Матчинг оператора — общая функция правил, та же, что использует
+          // «Пересчитать операторов» (resolveOperatorName_).
+          const operator = resolveOperatorName_(parsed.mango_side, employees, operatorMapping);
 
           push(
             'EMPLOYEE_MATCH_OPERATOR',
             filenameFixed,
-            'raw="' + operatorInput + '", status=' + operatorMatch.status +
-              ', bitrix="' + operatorMatch.full_name + '", id=' + operatorMatch.bitrix_user_id +
-              (operatorMatch.comment ? ', comment=' + operatorMatch.comment : '') +
-              (mapped
-                ? ', ручное сопоставление (лист «' + CONFIG.OPERATORS_SHEET_NAME + '»): ' +
-                  parsed.mango_side + ' → ' + mapped
-                : '')
+            describeOperatorResolution_(parsed.mango_side, operator)
           );
 
           const rowObj = {
@@ -459,7 +464,7 @@ function scanMangoRecordingsFolder() {
             client_phone: parsed.client_phone,
             mango_side: parsed.mango_side,
             line_name: parsed.line_name,
-            operator_name: operatorMatched ? operatorMatch.full_name : operatorInput,
+            operator_name: operator.operator_name,
 
             drive_file_id: file.getId(),
             drive_url: file.getUrl(),
@@ -511,6 +516,7 @@ function scanMangoRecordingsFolder() {
     push('FATAL', '', String((e && e.stack) || e));
     throw e;
   } finally {
+    lock.releaseLock();
     flushLog_(log);
   }
 }
@@ -1545,11 +1551,22 @@ const EMPLOYEES_HEADERS = [
 // Защита от бесконечного цикла пагинации user.get.
 const BITRIX_USER_PAGES_LIMIT = 40;
 
-// Сколько ждём scriptLock: ручной запуск и ночной триггер не должны
-// писать лист одновременно.
-const EMPLOYEES_LOCK_TIMEOUT_MS = 30000;
+// Сколько ждём scriptLock. Lock один на скрипт: скан, обновление
+// сотрудников (ручное и по ночному триггеру) и пересчёт операторов не
+// должны писать листы одновременно.
+const SHEET_LOCK_TIMEOUT_MS = 30000;
 
 const EMPLOYEES_TRIGGER_HANDLER = 'refreshEmployeesFromBitrix';
+
+// Сколько изменений перечислять в details события OPERATOR_RECALC_FINISH.
+// Пособытийный лог на строку не пишем: на сотнях строк он раздувает «Лог».
+const OPERATOR_RECALC_LOG_SAMPLE_LIMIT = 20;
+
+// Соседние изменённые строки пишутся одним setValues. Разрыв до этого
+// числа строк перекрывается тем же диапазоном (в промежутке пишутся их же
+// прежние значения) — так на сотнях разбросанных изменений получается
+// десятки вызовов записи вместо сотен.
+const OPERATOR_RECALC_MAX_WRITE_GAP = 25;
 
 // Заголовки листа «Операторы» (ручной маппинг). Лист ведёт пользователь,
 // скрипт его только читает.
@@ -1592,12 +1609,12 @@ function refreshEmployeesFromBitrix() {
 
   const lock = LockService.getScriptLock();
 
-  if (!lock.tryLock(EMPLOYEES_LOCK_TIMEOUT_MS)) {
+  if (!lock.tryLock(SHEET_LOCK_TIMEOUT_MS)) {
     push(
       'EMPLOYEES_REFRESH_LOCKED',
       '',
       'Обновление уже выполняется (lock не получен за ' +
-        EMPLOYEES_LOCK_TIMEOUT_MS + ' мс). Запуск пропущен.'
+        SHEET_LOCK_TIMEOUT_MS + ' мс). Запуск пропущен.'
     );
 
     flushLog_(log);
@@ -2051,6 +2068,274 @@ function loadOperatorMapping_(push) {
   OPERATOR_MAPPING_CACHE_ = mapping;
 
   return OPERATOR_MAPPING_CACHE_;
+}
+
+/**
+ * Единая реализация правил определения оператора (консолидированное ТЗ, п. 6):
+ * ручной маппинг листа «Операторы» по нормализованному mango_side (он
+ * авторитетнее автоматики) → matchEmployeeByName_ по «Сотрудникам» →
+ * итоговое значение operator_name. Полное ФИО из справочника подставляется
+ * только при надёжном статусе матчинга; иначе остаётся исходное значение,
+ * а причина видна в «Логе».
+ *
+ * Вызывают её и scanMangoRecordingsFolder(), и recalculateOperatorNames() —
+ * правила одни, вызова два.
+ *
+ * @param {string} mangoSide Сырое значение нашей стороны звонка (колонка mango_side).
+ * @param {Array} employees Справочник из loadEmployeesFromSheet_().
+ * @param {Object} operatorMapping Маппинг из loadOperatorMapping_().
+ * @return {{operator_name: string, status: string, comment: string,
+ *   bitrix_user_id: string, raw: string, full_name: string,
+ *   mapped: string, line_name: string}}
+ */
+function resolveOperatorName_(mangoSide, employees, operatorMapping) {
+  const side = String(mangoSide === null || mangoSide === undefined ? '' : mangoSide).trim();
+
+  // Исходное значение оператора берём заново из mango_side, а не из текущего
+  // operator_name: тот мог быть уже перезаписан прошлым пересчётом.
+  const parsedSide = parseMangoSide_(side);
+
+  const mapped = (operatorMapping || {})[normalizeFio_(side)] || '';
+  const raw = mapped || parsedSide.operator_name;
+
+  const match = matchEmployeeByName_(raw, employees);
+  const matched = isConfidentEmployeeMatch_(match.status);
+
+  return {
+    operator_name: matched ? match.full_name : raw,
+    status: match.status,
+    comment: match.comment,
+    bitrix_user_id: match.bitrix_user_id,
+    raw: raw,
+    full_name: match.full_name,
+    mapped: mapped,
+    line_name: parsedSide.line_name
+  };
+}
+
+/**
+ * Строка для события EMPLOYEE_MATCH_OPERATOR в «Логе».
+ */
+function describeOperatorResolution_(mangoSide, resolved) {
+  return 'raw="' + resolved.raw + '", status=' + resolved.status +
+    ', bitrix="' + resolved.full_name + '", id=' + resolved.bitrix_user_id +
+    (resolved.comment ? ', comment=' + resolved.comment : '') +
+    (resolved.mapped
+      ? ', ручное сопоставление (лист «' + CONFIG.OPERATORS_SHEET_NAME + '»): ' +
+        mangoSide + ' → ' + resolved.mapped
+      : '');
+}
+
+/************************************************************
+ * ПЕРЕСЧЁТ operator_name ПО ТЕКУЩИМ ЛИСТАМ «Операторы» И «Сотрудники»
+ *
+ * Строки, добавленные до пополнения этих листов, содержат сырое значение
+ * оператора из имени файла. Пункт меню «Пересчитать операторов» проходит
+ * по всем строкам «Записи звонков» и заново вычисляет operator_name теми же
+ * правилами, что и скан (resolveOperatorName_).
+ *
+ * Запуск многократный и идемпотентный: без изменений листов повторный
+ * прогон ничего не меняет. Ничего в n8n не переотправляется, никакие другие
+ * колонки (status, transcription_*, результаты анализа, call_key) не трогаются.
+ ************************************************************/
+
+function recalculateOperatorNames() {
+  const runId = 'operators-' + Date.now();
+  const log = [];
+
+  const push = function(step, file, details) {
+    log.push([
+      nowString_(),
+      runId,
+      String(step || ''),
+      String(file || '').slice(0, 300),
+      String(details || '').slice(0, 2000)
+    ]);
+  };
+
+  const lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(SHEET_LOCK_TIMEOUT_MS)) {
+    push(
+      'OPERATOR_RECALC_LOCKED',
+      '',
+      'Пересчёт/скан/обновление сотрудников уже выполняется (lock не получен за ' +
+        SHEET_LOCK_TIMEOUT_MS + ' мс). Запуск пропущен.'
+    );
+
+    flushLog_(log);
+    showToast_('Пересчёт уже выполняется');
+    return;
+  }
+
+  try {
+    push(
+      'OPERATOR_RECALC_START',
+      '',
+      'Пересчёт operator_name по листам «' + CONFIG.OPERATORS_SHEET_NAME + '» и «' +
+        CONFIG.EMPLOYEES_SHEET_NAME + '»'
+    );
+
+    const sheet = getOrCreateSheet_();
+    ensureHeaders_(sheet);
+
+    const headerMap = getHeaderMap_(sheet);
+    const operatorColumn = headerMap.operator_name;
+
+    if (!operatorColumn) {
+      throw new Error('На листе «' + CONFIG.SHEET_NAME + '» нет колонки operator_name.');
+    }
+
+    const mangoSideColumn = headerMap.mango_side;
+
+    if (!mangoSideColumn) {
+      throw new Error('На листе «' + CONFIG.SHEET_NAME + '» нет колонки mango_side.');
+    }
+
+    const updatedAtColumn = headerMap.updated_at;
+    const lastRow = sheet.getLastRow();
+
+    if (lastRow < 2) {
+      push('OPERATOR_RECALC_FINISH', '', 'Строк проверено: 0, изменено: 0, пропущено (ошибки парсинга): 0');
+      showToast_('Пересчёт операторов: изменено 0 из 0');
+      return;
+    }
+
+    // Справочники читаются по одному разу за прогон.
+    const employees = loadEmployeesFromSheet_(push);
+    const operatorMapping = loadOperatorMapping_(push);
+
+    // Лист читается одним getValues.
+    const rowCount = lastRow - 1;
+    const values = sheet.getRange(2, 1, rowCount, sheet.getLastColumn()).getValues();
+
+    const now = nowString_();
+
+    // Снимки колонок: изменения вносим в них, а пишем блоками (см. ниже).
+    const operatorColumnValues = values.map(function(row) {
+      return [row[operatorColumn - 1]];
+    });
+
+    const updatedAtColumnValues = updatedAtColumn
+      ? values.map(function(row) { return [row[updatedAtColumn - 1]]; })
+      : null;
+
+    let checked = 0;
+    let changed = 0;
+    let skipped = 0;
+
+    const changedRowNumbers = [];
+    const samples = [];
+
+    values.forEach(function(row, index) {
+      const rowNumber = index + 2;
+
+      const mangoSide = String(row[mangoSideColumn - 1] === null || row[mangoSideColumn - 1] === undefined
+        ? ''
+        : row[mangoSideColumn - 1]).trim();
+
+      // Строки с ошибкой разбора имени файла: mango_side пуст, вычислять
+      // оператора не из чего.
+      if (!mangoSide) {
+        skipped++;
+        return;
+      }
+
+      checked++;
+
+      const resolved = resolveOperatorName_(mangoSide, employees, operatorMapping);
+
+      const oldValue = String(row[operatorColumn - 1] === null || row[operatorColumn - 1] === undefined
+        ? ''
+        : row[operatorColumn - 1]).trim();
+
+      const newValue = String(resolved.operator_name || '');
+
+      // Значение не изменилось — строку не трогаем.
+      if (newValue === oldValue) return;
+
+      operatorColumnValues[index][0] = newValue;
+
+      if (updatedAtColumnValues) updatedAtColumnValues[index][0] = now;
+
+      changedRowNumbers.push(rowNumber);
+      changed++;
+
+      if (samples.length < OPERATOR_RECALC_LOG_SAMPLE_LIMIT) {
+        samples.push(
+          (oldValue || '(пусто)') + ' → ' + (newValue || '(пусто)') + ' (строка ' + rowNumber + ')'
+        );
+      }
+    });
+
+    if (changedRowNumbers.length > 0) {
+      const blocks = collectWriteBlocks_(changedRowNumbers, OPERATOR_RECALC_MAX_WRITE_GAP);
+
+      push(
+        'OPERATOR_RECALC_WRITE',
+        '',
+        'Запись изменений: строк ' + changedRowNumbers.length + ', диапазонов ' + blocks.length
+      );
+
+      blocks.forEach(function(block) {
+        const offset = block.start - 2;
+        const height = block.end - block.start + 1;
+
+        sheet
+          .getRange(block.start, operatorColumn, height, 1)
+          .setValues(operatorColumnValues.slice(offset, offset + height));
+
+        if (updatedAtColumnValues) {
+          sheet
+            .getRange(block.start, updatedAtColumn, height, 1)
+            .setValues(updatedAtColumnValues.slice(offset, offset + height));
+        }
+      });
+    }
+
+    const details =
+      'Строк проверено: ' + checked +
+      ', изменено: ' + changed +
+      ', пропущено (ошибки парсинга): ' + skipped +
+      (samples.length ? '. Изменения: ' + samples.join('; ') : '');
+
+    push('OPERATOR_RECALC_FINISH', '', details);
+    showToast_('Пересчёт операторов: изменено ' + changed + ' из ' + checked);
+
+  } catch (e) {
+    push('OPERATOR_RECALC_ERROR', '', String((e && e.stack) || e));
+    showToast_('Ошибка пересчёта операторов: ' + String((e && e.message) || e));
+    throw e;
+  } finally {
+    lock.releaseLock();
+    flushLog_(log);
+  }
+}
+
+/**
+ * Номера изменённых строк → диапазоны для батчевой записи.
+ * Соседние и близкие строки (разрыв ≤ maxGap) объединяются в один диапазон:
+ * в промежутке записываются те же значения, что там уже стоят.
+ *
+ * [3, 4, 5, 40, 41] при maxGap = 25 → [{start: 3, end: 5}, {start: 40, end: 41}]
+ */
+function collectWriteBlocks_(rowNumbers, maxGap) {
+  const gap = Math.max(1, Number(maxGap) || 1);
+  const sorted = (rowNumbers || []).slice().sort(function(a, b) { return a - b; });
+  const blocks = [];
+
+  sorted.forEach(function(rowNumber) {
+    const last = blocks[blocks.length - 1];
+
+    if (last && rowNumber - last.end <= gap) {
+      last.end = rowNumber;
+      return;
+    }
+
+    blocks.push({ start: rowNumber, end: rowNumber });
+  });
+
+  return blocks;
 }
 
 /**

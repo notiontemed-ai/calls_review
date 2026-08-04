@@ -4,32 +4,37 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "mango-call-transcribe-stereo-safe-v2",
-        "responseMode": "onReceived",
-        "responseData": "{\"status\":\"accepted\"}",
+        "authentication": "headerAuth",
         "options": {}
       },
-      "id": "4d2e0cd5-7979-46da-86b4-828ed702371a",
+      "id": "15eb0143-a9e5-41a2-800c-042a5b21cddf",
       "name": "Webhook Mango Call",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
       "position": [
         -2336,
-        -128
+        1168
       ],
       "webhookId": "07b9d2b9-1ee8-465d-912c-8abba49d68db",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "LSmyXjPWIXNLGB8n",
+          "name": "X-TEMED-CALLS-SECRET"
+        }
+      },
       "notes": "Отвечает 200 сразу при приёме (respond immediately). Apps Script не ждёт окончания обработки: статус SENT означает «принято в обработку», факт результата виден по колонке transcription_received_at."
     },
     {
       "parameters": {
-        "jsCode": "const input = $input.first().json;\nconst body = input.body || input;\n\n// Колонки результата. Список ОБЩИЙ со скриптом Apps Script:\n// он обязан совпадать 1:1 с константой RESULT_HEADERS в файле `code`.\n// Дальше по цепочке список едет в meta.result_fields, поэтому нода\n// Prepare Sheet Update берёт его отсюда и своей копии не держит.\nconst RESULT_FIELDS = [\n  'transcription_received_at',\n  'transcription_error',\n  'transcript_text',\n  'transcript_left',\n  'transcript_right',\n  'summary',\n  'overall_score',\n  'problem_level',\n  'is_problem_call',\n  'main_strength',\n  'main_error',\n  'recommended_feedback',\n  'rule_results_json',\n  'prompt_version',\n  'transcription_n8n_execution_id'\n];\n\nif (body.action !== 'transcribe_and_analyze_call') {\n  throw new Error(`Unknown action: ${body.action}`);\n}\n\nif (!body.call_key) throw new Error('Missing call_key');\nif (!body.drive_file_id) throw new Error('Missing drive_file_id');\n\n// Координаты записи результата: результат пишется прямо в Google Sheets,\n// callback в Apps Script больше не используется.\nif (!body.spreadsheet_id) throw new Error('Missing spreadsheet_id');\nif (!body.sheet_name) throw new Error('Missing sheet_name');\n\nconst rowNumber = Number(body.row_number);\n\nif (!Number.isInteger(rowNumber) || rowNumber < 2) {\n  throw new Error(`Invalid row_number: ${body.row_number} (expected integer >= 2)`);\n}\n\nconst resultColumns = body.result_columns;\n\nif (!resultColumns || typeof resultColumns !== 'object' || Array.isArray(resultColumns)) {\n  throw new Error('Missing result_columns object');\n}\n\nconst normalizedColumns = {};\nconst missingColumns = [];\nconst invalidColumns = [];\n\nfor (const field of RESULT_FIELDS) {\n  const letter = String(resultColumns[field] ?? '').trim().toUpperCase();\n\n  if (!letter) {\n    missingColumns.push(field);\n    continue;\n  }\n\n  if (!/^[A-Z]{1,3}$/.test(letter)) {\n    invalidColumns.push(`${field}=${resultColumns[field]}`);\n    continue;\n  }\n\n  normalizedColumns[field] = letter;\n}\n\nif (missingColumns.length) {\n  throw new Error(`Missing result_columns for: ${missingColumns.join(', ')}`);\n}\n\nif (invalidColumns.length) {\n  throw new Error(`Invalid column letters in result_columns: ${invalidColumns.join(', ')}`);\n}\n\nif (!body.prompts?.transcription_prompt) {\n  throw new Error('Missing prompts.transcription_prompt');\n}\n\nif (!Array.isArray(body.prompts?.evaluation_rules) || body.prompts.evaluation_rules.length === 0) {\n  throw new Error('Missing prompts.evaluation_rules');\n}\n\nconst tempId = `mango_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;\n\nreturn [\n  {\n    json: {\n      action: body.action,\n\n      call_key: body.call_key,\n      filename_fixed: body.filename_fixed || '',\n\n      call_datetime: body.call_datetime || '',\n      call_date: body.call_date || '',\n      call_time: body.call_time || '',\n\n      direction: body.direction || '',\n      client_phone: body.client_phone || '',\n      mango_side: body.mango_side || '',\n      line_name: body.line_name || '',\n      operator_name: body.operator_name || '',\n\n      drive_file_id: body.drive_file_id,\n      drive_url: body.drive_url || '',\n\n      spreadsheet_id: body.spreadsheet_id,\n      sheet_name: body.sheet_name,\n      row_number: rowNumber,\n      result_columns: normalizedColumns,\n      result_fields: RESULT_FIELDS,\n\n      prompt_version: body.prompt_version || body.prompts.prompt_version || '',\n\n      prompts: {\n        prompt_version: body.prompts.prompt_version || body.prompt_version || '',\n        transcription_prompt: body.prompts.transcription_prompt || '',\n        analysis_system_prompt: body.prompts.analysis_system_prompt || '',\n        output_schema: body.prompts.output_schema || '',\n        evaluation_rules: body.prompts.evaluation_rules\n      },\n\n      temp: {\n        id: tempId,\n        inputPath: `/tmp/${tempId}.mp3`,\n        leftPath: `/tmp/${tempId}_left.wav`,\n        rightPath: `/tmp/${tempId}_right.wav`,\n        splitLogPath: `/tmp/${tempId}_split.log`\n      }\n    }\n  }\n];\n"
+        "jsCode": "const input = $input.first().json;\nconst body = input.body || input;\n\n// Колонки результата. Список ОБЩИЙ со скриптом Apps Script:\n// он обязан совпадать 1:1 с константой RESULT_HEADERS в файле `code`.\n// Дальше по цепочке список едет в meta.result_fields, поэтому нода\n// Prepare Sheet Update берёт его отсюда и своей копии не держит.\nconst RESULT_FIELDS = [\n  'transcription_received_at',\n  'transcription_error',\n  'transcript_text',\n  'transcript_left',\n  'transcript_right',\n  'summary',\n  'overall_score',\n  'problem_level',\n  'is_problem_call',\n  'main_strength',\n  'main_error',\n  'recommended_feedback',\n  'is_target_call',\n  'non_target_reason',\n  'non_target_detail',\n  'no_booking_reason',\n  'no_booking_detail',\n  'is_primary_patient',\n  'requested_specialist',\n  'is_appointment_booked',\n  'appointment_specialist',\n  'appointment_datetime',\n  'city',\n  'referral_source',\n  'rule_results_json',\n  'prompt_version',\n  'transcription_n8n_execution_id'\n];\n\nif (body.action !== 'transcribe_and_analyze_call') {\n  throw new Error(`Unknown action: ${body.action}`);\n}\n\nif (!body.call_key) throw new Error('Missing call_key');\nif (!body.drive_file_id) throw new Error('Missing drive_file_id');\n\n// Координаты записи результата: результат пишется прямо в Google Sheets,\n// callback в Apps Script больше не используется.\nif (!body.spreadsheet_id) throw new Error('Missing spreadsheet_id');\nif (!body.sheet_name) throw new Error('Missing sheet_name');\n\nconst rowNumber = Number(body.row_number);\n\nif (!Number.isInteger(rowNumber) || rowNumber < 2) {\n  throw new Error(`Invalid row_number: ${body.row_number} (expected integer >= 2)`);\n}\n\nconst resultColumns = body.result_columns;\n\nif (!resultColumns || typeof resultColumns !== 'object' || Array.isArray(resultColumns)) {\n  throw new Error('Missing result_columns object');\n}\n\nconst normalizedColumns = {};\nconst missingColumns = [];\nconst invalidColumns = [];\n\nfor (const field of RESULT_FIELDS) {\n  const letter = String(resultColumns[field] ?? '').trim().toUpperCase();\n\n  if (!letter) {\n    missingColumns.push(field);\n    continue;\n  }\n\n  if (!/^[A-Z]{1,3}$/.test(letter)) {\n    invalidColumns.push(`${field}=${resultColumns[field]}`);\n    continue;\n  }\n\n  normalizedColumns[field] = letter;\n}\n\nif (missingColumns.length) {\n  throw new Error(`Missing result_columns for: ${missingColumns.join(', ')}`);\n}\n\nif (invalidColumns.length) {\n  throw new Error(`Invalid column letters in result_columns: ${invalidColumns.join(', ')}`);\n}\n\nif (!body.prompts?.transcription_prompt) {\n  throw new Error('Missing prompts.transcription_prompt');\n}\n\nif (!Array.isArray(body.prompts?.evaluation_rules) || body.prompts.evaluation_rules.length === 0) {\n  throw new Error('Missing prompts.evaluation_rules');\n}\n\nconst tempId = `mango_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;\n\nreturn [\n  {\n    json: {\n      action: body.action,\n\n      call_key: body.call_key,\n      filename_fixed: body.filename_fixed || '',\n\n      call_datetime: body.call_datetime || '',\n      call_date: body.call_date || '',\n      call_time: body.call_time || '',\n\n      direction: body.direction || '',\n      client_phone: body.client_phone || '',\n      mango_side: body.mango_side || '',\n      line_name: body.line_name || '',\n      operator_name: body.operator_name || '',\n\n      drive_file_id: body.drive_file_id,\n      drive_url: body.drive_url || '',\n\n      spreadsheet_id: body.spreadsheet_id,\n      sheet_name: body.sheet_name,\n      row_number: rowNumber,\n      result_columns: normalizedColumns,\n      result_fields: RESULT_FIELDS,\n\n      prompt_version: body.prompt_version || body.prompts.prompt_version || '',\n\n      prompts: {\n        prompt_version: body.prompts.prompt_version || body.prompt_version || '',\n        transcription_prompt: body.prompts.transcription_prompt || '',\n        analysis_system_prompt: body.prompts.analysis_system_prompt || '',\n        output_schema: body.prompts.output_schema || '',\n        evaluation_rules: body.prompts.evaluation_rules,\n        staff_list: Array.isArray(body.prompts.staff_list) ? body.prompts.staff_list : []\n      },\n\n      temp: {\n        id: tempId,\n        inputPath: `/tmp/${tempId}.mp3`,\n        leftPath: `/tmp/${tempId}_left.wav`,\n        rightPath: `/tmp/${tempId}_right.wav`,\n        splitLogPath: `/tmp/${tempId}_split.log`\n      }\n    }\n  }\n];\n"
       },
-      "id": "fd50e9c0-b4a8-4c48-be94-76c252be1621",
+      "id": "2180d0fb-de9d-470c-881d-d63fb9e49776",
       "name": "Normalize Incoming Payload",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        -2096,
-        -128
+        -2112,
+        1168
       ]
     },
     {
@@ -44,27 +49,33 @@
           "binaryPropertyName": "audio"
         }
       },
-      "id": "f653e071-33a3-491a-b723-b0d77d42bd48",
+      "id": "dbb48522-7170-4860-a923-bf870a555613",
       "name": "Google Drive - Download audio",
       "type": "n8n-nodes-base.googleDrive",
       "typeVersion": 3,
       "position": [
-        -1856,
-        -128
+        -1888,
+        1168
       ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "TNzQuNMF9xLFaJeE",
+          "name": "Mnogobotoff|G.Drive"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "jsCode": "const meta = $items('Normalize Incoming Payload')[0].json;\nconst current = $input.first();\n\nif (!current.binary || !current.binary.audio) {\n  throw new Error('Google Drive node did not return binary field \"audio\"');\n}\n\nreturn [\n  {\n    json: meta,\n    binary: {\n      audio: current.binary.audio\n    }\n  }\n];"
       },
-      "id": "fd12723e-4eac-4e7d-8898-ac3b72f30f4d",
+      "id": "5d29032b-7884-418d-bd85-3e596afd7733",
       "name": "Attach Meta To Audio",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        -1616,
-        -128
+        -1664,
+        1088
       ],
       "onError": "continueErrorOutput"
     },
@@ -74,13 +85,13 @@
         "dataPropertyName": "audio",
         "options": {}
       },
-      "id": "2bcbdeb2-81b3-4a50-b490-4b4b0e75ded5",
+      "id": "98981a60-9344-4278-b7e7-4ffb42f6e3db",
       "name": "Write Source Audio To Disk",
       "type": "n8n-nodes-base.writeBinaryFile",
       "typeVersion": 1,
       "position": [
-        -1376,
-        -128
+        -1440,
+        1024
       ],
       "onError": "continueErrorOutput"
     },
@@ -88,61 +99,87 @@
       "parameters": {
         "jsCode": "const meta = $items('Attach Meta To Audio')[0].json;\n\nif (!meta.temp?.inputPath || !meta.temp?.leftPath || !meta.temp?.rightPath) {\n  throw new Error('Missing temp paths before FFmpeg Split Channels');\n}\n\nreturn [\n  {\n    json: meta\n  }\n];"
       },
-      "id": "e923a78d-0c4d-40f3-81a6-fd26aafa66e1",
+      "id": "44335167-bc00-4463-8e96-1e262bed63fd",
       "name": "Prepare FFmpeg Input",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        -1136,
-        -128
+        -1216,
+        944
       ],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "command": "=IN='{{ $json.temp.inputPath }}'; L='{{ $json.temp.leftPath }}'; R='{{ $json.temp.rightPath }}'; LOG='{{ $json.temp.splitLogPath }}'; echo \"IN=$IN\"; echo \"L=$L\"; echo \"R=$R\"; echo \"LOG=$LOG\"; echo \"--- ffmpeg ---\"; /usr/bin/ffmpeg -version | head -n 1; echo \"--- ffprobe ---\"; /usr/bin/ffprobe -version | head -n 1; CH=$(/usr/bin/ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 \"$IN\" 2>/dev/null); echo \"CH=$CH\"; MV=$(/usr/bin/ffmpeg -hide_banner -i \"$IN\" -af volumedetect -f null - 2>&1 | grep mean_volume | sed 's/.*: //; s/ dB//'); echo \"MV=$MV\"; if [ -n \"$MV\" ] && awk -v v=\"$MV\" 'BEGIN{exit !(v < -45)}'; then echo \"EMPTY:$MV\"; elif [ \"$CH\" = \"2\" ]; then if /usr/bin/ffmpeg -hide_banner -loglevel error -i \"$IN\" -filter_complex \"channelsplit=channel_layout=stereo[l][r];[l]aformat=channel_layouts=mono[L];[r]aformat=channel_layouts=mono[R]\" -map \"[L]\" -ar 16000 -ac 1 -y \"$L\" -map \"[R]\" -ar 16000 -ac 1 -y \"$R\" 2>\"$LOG\"; then if [ -s \"$L\" ] && [ -s \"$R\" ]; then echo \"OK:stereo:$MV\"; else echo \"ERROR: пустые файлы после разделения каналов\"; exit 1; fi; else echo \"ERROR: $(tail -c 1500 \"$LOG\" | tr '\\n' ' ')\"; exit 1; fi; elif [ \"$CH\" = \"1\" ]; then if /usr/bin/ffmpeg -hide_banner -loglevel error -i \"$IN\" -ar 16000 -ac 1 -y \"$L\" 2>\"$LOG\"; then if [ -s \"$L\" ]; then cp \"$L\" \"$R\"; echo \"OK:mono:$MV\"; else echo \"ERROR: пустой файл после конвертации\"; exit 1; fi; else echo \"ERROR: $(tail -c 1500 \"$LOG\" | tr '\\n' ' ')\"; exit 1; fi; else echo \"ERROR: неожиданное число каналов: $CH\"; exit 1; fi"
+        "command": "=IN='{{ $json.temp.inputPath }}'; L='{{ $json.temp.leftPath }}'; R='{{ $json.temp.rightPath }}'; LOG='{{ $json.temp.splitLogPath }}'; echo \"IN=$IN\"; echo \"L=$L\"; echo \"R=$R\"; echo \"LOG=$LOG\"; echo \"--- ffmpeg ---\"; /usr/bin/ffmpeg -version | head -n 1; echo \"--- ffprobe ---\"; /usr/bin/ffprobe -version | head -n 1; CH=$(/usr/bin/ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 \"$IN\" 2>/dev/null); echo \"CH=$CH\"; MV=$(/usr/bin/ffmpeg -hide_banner -i \"$IN\" -af volumedetect -f null - 2>&1 | grep mean_volume | sed 's/.*: //; s/ dB//'); echo \"MV=$MV\"; if [ -n \"$MV\" ] && awk -v v=\"$MV\" 'BEGIN{exit !(v < -45)}'; then echo \"ERROR: пустая запись (тишина), mean_volume=$MV dB\"; exit 1; elif [ \"$CH\" = \"2\" ]; then if /usr/bin/ffmpeg -hide_banner -loglevel error -i \"$IN\" -filter_complex \"channelsplit=channel_layout=stereo[l][r];[l]aformat=channel_layouts=mono[L];[r]aformat=channel_layouts=mono[R]\" -map \"[L]\" -ar 16000 -ac 1 -y \"$L\" -map \"[R]\" -ar 16000 -ac 1 -y \"$R\" 2>\"$LOG\"; then if [ -s \"$L\" ] && [ -s \"$R\" ]; then echo \"OK:stereo:$MV\"; else echo \"ERROR: пустые файлы после разделения каналов\"; exit 1; fi; else echo \"ERROR: $(tail -c 1500 \"$LOG\" | tr '\\n' ' ')\"; exit 1; fi; elif [ \"$CH\" = \"1\" ]; then if /usr/bin/ffmpeg -hide_banner -loglevel error -i \"$IN\" -ar 16000 -ac 1 -y \"$L\" 2>\"$LOG\"; then if [ -s \"$L\" ]; then cp \"$L\" \"$R\"; echo \"OK:mono:$MV\"; else echo \"ERROR: пустой файл после конвертации\"; exit 1; fi; else echo \"ERROR: $(tail -c 1500 \"$LOG\" | tr '\\n' ' ')\"; exit 1; fi; else echo \"ERROR: неожиданное число каналов: $CH\"; exit 1; fi"
       },
-      "id": "b89e535c-1722-49e7-962a-a00843eb97c1",
+      "id": "1fb6e39a-2c11-4063-933d-d2ee204df428",
       "name": "FFmpeg Split Channels",
       "type": "n8n-nodes-base.executeCommand",
       "typeVersion": 1,
       "position": [
-        -896,
-        -128
+        -992,
+        784
       ],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "filePath": "={{ $items('Prepare FFmpeg Input')[0].json.temp.leftPath }}",
-        "dataPropertyName": "audio"
+        "dataPropertyName": "audio_left"
       },
-      "id": "4aa18a2b-0cf9-4653-aa4f-8c06b034936e",
+      "id": "4dc08555-9bb5-4290-89b6-88bc11d9f03d",
       "name": "Read Left Channel",
       "type": "n8n-nodes-base.readBinaryFile",
       "typeVersion": 1,
       "position": [
-        -656,
-        -304
+        -768,
+        160
       ],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "resource": "audio",
-        "operation": "transcribe",
-        "binaryPropertyName": "audio",
-        "options": {
-          "language": "ru"
-        }
+        "method": "POST",
+        "url": "https://api.proxyapi.ru/openai/v1/audio/transcriptions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "audio_left"
+            },
+            {
+              "name": "model",
+              "value": "gpt-4o-mini-transcribe"
+            },
+            {
+              "name": "language",
+              "value": "ru"
+            },
+            {
+              "name": "response_format",
+              "value": "json"
+            },
+            {
+              "name": "prompt",
+              "value": "={{ $items('Prepare FFmpeg Input')[0].json.prompts.transcription_prompt }}"
+            }
+          ]
+        },
+        "options": {}
       },
-      "id": "04814bb4-edec-48dc-ada9-2732147b9fe5",
+      "id": "22f7c1ad-a546-4ef0-8468-7a411aa42a5d",
       "name": "OpenAI - Transcribe left",
-      "type": "@n8n/n8n-nodes-langchain.openAi",
-      "typeVersion": 1.8,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
       "position": [
-        -416,
-        -304
+        -320,
+        -96
       ],
       "credentials": {
         "openAiApi": {
@@ -156,47 +193,73 @@
       "parameters": {
         "jsCode": "const out = $input.first().json;\nconst meta = $items('Prepare FFmpeg Input')[0].json;\n\nconst text =\n  out.text ||\n  out.transcript ||\n  out.transcription ||\n  out.data?.text ||\n  out.message?.content ||\n  out.output ||\n  '';\n\nif (!text) {\n  throw new Error('Empty left channel transcript');\n}\n\nreturn [\n  {\n    json: {\n      ...meta,\n      channel: 'left',\n      transcript_left: String(text).trim()\n    }\n  }\n];"
       },
-      "id": "d8b2377e-2c0e-423c-b01c-22f3628e43d7",
+      "id": "020b8736-2daa-4867-8752-c6a7e024db43",
       "name": "Prepare Left Transcript",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        -176,
-        -304
+        -96,
+        -160
       ],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "filePath": "={{ $items('Prepare FFmpeg Input')[0].json.temp.rightPath }}",
-        "dataPropertyName": "audio"
+        "dataPropertyName": "audio_right"
       },
-      "id": "3d2d0d80-315d-4d89-ab34-10fa775ee9c8",
+      "id": "ff85aa72-0a21-4360-8f66-332e8ba0027d",
       "name": "Read Right Channel",
       "type": "n8n-nodes-base.readBinaryFile",
       "typeVersion": 1,
       "position": [
-        -656,
-        64
+        -768,
+        784
       ],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "resource": "audio",
-        "operation": "transcribe",
-        "binaryPropertyName": "audio",
-        "options": {
-          "language": "ru"
-        }
+        "method": "POST",
+        "url": "https://api.proxyapi.ru/openai/v1/audio/transcriptions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "audio_right"
+            },
+            {
+              "name": "model",
+              "value": "gpt-4o-mini-transcribe"
+            },
+            {
+              "name": "language",
+              "value": "ru"
+            },
+            {
+              "name": "response_format",
+              "value": "json"
+            },
+            {
+              "name": "prompt",
+              "value": "={{ $items('Prepare FFmpeg Input')[0].json.prompts.transcription_prompt }}"
+            }
+          ]
+        },
+        "options": {}
       },
-      "id": "88dd9bc4-1022-4bb5-9cec-5a44bf4f1e10",
+      "id": "25def51b-89c1-401c-8607-39625eea724e",
       "name": "OpenAI - Transcribe right",
-      "type": "@n8n/n8n-nodes-langchain.openAi",
-      "typeVersion": 1.8,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
       "position": [
-        -416,
-        64
+        -320,
+        416
       ],
       "credentials": {
         "openAiApi": {
@@ -210,13 +273,13 @@
       "parameters": {
         "jsCode": "const out = $input.first().json;\nconst meta = $items('Prepare FFmpeg Input')[0].json;\n\nconst text =\n  out.text ||\n  out.transcript ||\n  out.transcription ||\n  out.data?.text ||\n  out.message?.content ||\n  out.output ||\n  '';\n\nif (!text) {\n  throw new Error('Empty right channel transcript');\n}\n\nreturn [\n  {\n    json: {\n      ...meta,\n      channel: 'right',\n      transcript_right: String(text).trim()\n    }\n  }\n];"
       },
-      "id": "69270772-97d7-4ac1-9cdc-65d0f96725cb",
+      "id": "6a0fa63c-004b-4d0f-9a35-437a8ece9e50",
       "name": "Prepare Right Transcript",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        -176,
-        64
+        -96,
+        352
       ],
       "onError": "continueErrorOutput"
     },
@@ -226,26 +289,26 @@
         "combineBy": "combineByPosition",
         "options": {}
       },
-      "id": "978fb61e-336c-440f-9655-df47e2b04c4d",
+      "id": "6e49af3f-4aca-44d2-9f86-bedf9413f3ef",
       "name": "Merge Left + Right",
       "type": "n8n-nodes-base.merge",
       "typeVersion": 3,
       "position": [
-        96,
-        -128
+        128,
+        -208
       ]
     },
     {
       "parameters": {
-        "jsCode": "const leftItem = $items('Prepare Left Transcript')[0]?.json || {};\nconst rightItem = $items('Prepare Right Transcript')[0]?.json || {};\nconst baseMeta = $items('Prepare FFmpeg Input')[0]?.json || {};\n\nconst meta = {\n  ...baseMeta,\n  ...leftItem,\n  ...rightItem\n};\n\nif (!leftItem.transcript_left) {\n  throw new Error('No transcript_left');\n}\n\nif (!rightItem.transcript_right) {\n  throw new Error('No transcript_right');\n}\n\nconst transcriptChannels = {\n  left: leftItem.transcript_left,\n  right: rightItem.transcript_right\n};\n\nconst transcriptText = [\n  'Двухканальная запись телефонного разговора.',\n  '',\n  'Канал left:',\n  transcriptChannels.left,\n  '',\n  'Канал right:',\n  transcriptChannels.right\n].join('\\n');\n\nconst systemPrompt = meta.prompts.analysis_system_prompt || [\n  'Ты анализируешь звонки операторов клиники TEMED.',\n  'Оценивай звонок только по переданным evaluation_rules.',\n  'Не добавляй новых правил от себя.',\n  'Верни только валидный JSON без markdown.',\n  'Не выдумывай факты, которых нет в транскрипте.',\n  'Не оценивай клиническую правильность лечения.',\n  'Не проверяй цены, скидки, акции, расписание, предоплату, рассрочку и коммерческие условия.'\n].join(' ');\n\nconst callMeta = [\n  `call_key: ${meta.call_key}`,\n  `Дата/время: ${meta.call_datetime}`,\n  `Направление: ${meta.direction}`,\n  `Телефон клиента: ${meta.client_phone}`,\n  `Наша сторона: ${meta.mango_side}`,\n  `Линия: ${meta.line_name}`,\n  `Оператор: ${meta.operator_name}`\n].join('\\n');\n\nconst defaultSchema = {\n  summary: 'Краткое содержание звонка',\n  overall_score: 'Число 1-5, взвешенная итоговая оценка без учета N/A',\n  problem_level: 'NONE | LOW | MEDIUM | HIGH | CRITICAL',\n  is_problem_call: 'boolean',\n  channel_roles: {\n    left: 'operator | client | unknown',\n    right: 'operator | client | unknown',\n    confidence: 'low | medium | high',\n    reason: 'почему роли распределены именно так'\n  },\n  main_strength: 'Главная сильная сторона оператора',\n  main_error: 'Главная ошибка оператора',\n  recommended_feedback: 'Краткая рекомендация для обратной связи оператору',\n  rule_results: [\n    {\n      rule_id: 'строго один из rule_id из evaluation_rules',\n      score: 'число 1-5 или null если N/A',\n      is_na: 'boolean',\n      reason: 'почему такая оценка',\n      evidence: 'фрагмент или наблюдение из звонка',\n      recommendation: 'что улучшить или сохранить'\n    }\n  ]\n};\n\nconst userPrompt = [\n  'Проанализируй двухканальную запись телефонного разговора оператора клиники TEMED.',\n  '',\n  'Данные звонка:',\n  callMeta,\n  '',\n  'Важно про каналы:',\n  '1. Запись стерео разделена на два канала: left и right.',\n  '2. Один канал обычно содержит речь оператора, второй — речь клиента.',\n  '3. Сначала определи, какой канал вероятнее оператор, а какой клиент.',\n  '4. Если не уверен, укажи unknown и объясни причину.',\n  '5. Оператор обычно представляется, говорит от имени клиники, задает вопросы, предлагает запись или следующий шаг.',\n  '6. Клиент обычно отвечает на вопросы, описывает проблему, сомневается или задает уточняющие вопросы.',\n  '',\n  'Правила оценки evaluation_rules:',\n  JSON.stringify(meta.prompts.evaluation_rules, null, 2),\n  '',\n  'Инструкция:',\n  '1. Оцени звонок по каждому правилу из evaluation_rules.',\n  '2. Для каждого правила верни результат с тем же rule_id.',\n  '3. Не добавляй новых rule_id.',\n  '4. Если правило неприменимо и na_allowed = true, поставь is_na = true и score = null.',\n  '5. Если правило применимо, поставь is_na = false и score от 1 до 5.',\n  '6. Обязательно дай reason, evidence и recommendation.',\n  '7. N/A не участвует в overall_score.',\n  '8. overall_score считай с учетом weight.',\n  '9. Если score <= critical_if_score_lte по любому правилу, problem_level минимум HIGH и is_problem_call = true.',\n  '10. Если score <= problem_if_score_lte по любому правилу, problem_level минимум MEDIUM и is_problem_call = true.',\n  '11. Не проверяй цены, скидки, акции, расписание и коммерческие условия.',\n  '',\n  'Транскрипт канала left:',\n  transcriptChannels.left,\n  '',\n  'Транскрипт канала right:',\n  transcriptChannels.right,\n  '',\n  'Формат ответа:',\n  meta.prompts.output_schema || JSON.stringify(defaultSchema, null, 2),\n  '',\n  'Обязательно добавь в JSON поле channel_roles.',\n  'Верни только JSON без markdown.'\n].join('\\n');\n\nreturn [\n  {\n    json: {\n      ...meta,\n      transcript_text: transcriptText,\n      transcript_channels: transcriptChannels,\n      systemPrompt,\n      userPrompt\n    }\n  }\n];"
+        "jsCode": "const leftItem = $items('Prepare Left Transcript')[0]?.json || {};\nconst rightItem = $items('Prepare Right Transcript')[0]?.json || {};\nconst baseMeta = $items('Prepare FFmpeg Input')[0]?.json || {};\n\nconst meta = {\n  ...baseMeta,\n  ...leftItem,\n  ...rightItem\n};\n\nif (!leftItem.transcript_left) {\n  throw new Error('No transcript_left');\n}\n\nif (!rightItem.transcript_right) {\n  throw new Error('No transcript_right');\n}\n\nconst transcriptChannels = {\n  left: leftItem.transcript_left,\n  right: rightItem.transcript_right\n};\n\nconst transcriptText = [\n  'Двухканальная запись телефонного разговора.',\n  '',\n  'Канал left:',\n  transcriptChannels.left,\n  '',\n  'Канал right:',\n  transcriptChannels.right\n].join('\\n');\n\nconst systemPrompt = meta.prompts.analysis_system_prompt || [\n  'Ты анализируешь звонки операторов клиники TEMED.',\n  'Оценивай звонок только по переданным evaluation_rules.',\n  'Не добавляй новых правил от себя.',\n  'Верни только валидный JSON без markdown.',\n  'Не выдумывай факты, которых нет в транскрипте.',\n  'Не оценивай клиническую правильность лечения.',\n  'Не проверяй цены, скидки, акции, расписание, предоплату, рассрочку и коммерческие условия.'\n].join(' ');\n\nconst callMeta = [\n  `call_key: ${meta.call_key}`,\n  `Дата/время: ${meta.call_datetime}`,\n  `Направление: ${meta.direction}`,\n  `Телефон клиента: ${meta.client_phone}`,\n  `Наша сторона: ${meta.mango_side}`,\n  `Линия: ${meta.line_name}`,\n  `Оператор: ${meta.operator_name}`\n].join('\\n');\n\nconst defaultSchema = {\n  summary: 'Краткое содержание звонка',\n  overall_score: 'Число 1-5, взвешенная итоговая оценка без учета N/A',\n  problem_level: 'NONE | LOW | MEDIUM | HIGH | CRITICAL',\n  is_problem_call: 'boolean',\n  channel_roles: {\n    left: 'operator | client | unknown',\n    right: 'operator | client | unknown',\n    confidence: 'low | medium | high',\n    reason: 'почему роли распределены именно так'\n  },\n  main_strength: 'Главная сильная сторона оператора',\n  main_error: 'Главная ошибка оператора',\n  recommended_feedback: 'Краткая рекомендация для обратной связи оператору',\n  is_target_call: 'boolean — целевой ли звонок (обращение потенциального или действующего пациента по вопросам приёма/лечения)',\n  non_target_reason: \"если is_target_call = false — строго одна категория: spam | no_service | wrong_city | no_slots | off_hours | price | other; иначе пустая строка\",\n  non_target_detail: 'если is_target_call = false — что именно хотел звонящий, свободным текстом (например: МРТ коленного сустава, травматолог в Кургане); иначе пустая строка',\n  no_booking_reason: \"если звонок целевой (is_target_call = true), но запись НЕ состоялась (is_appointment_booked = false) — строго одна категория: thinking | price | info_only | callback | declined | other; иначе пустая строка\",\n  no_booking_detail: 'если заполнен no_booking_reason — детали свободным текстом (что смутило, что узнавал); иначе пустая строка',\n  is_primary_patient: \"строго одно из: primary | repeat | unknown. primary — впервые обращается в клинику, repeat — уже был пациентом (упоминает прошлые визиты, продление, оператор находит карту), unknown — из разговора не ясно\",\n  requested_specialist: 'если клиент ЦЕЛЕНАПРАВЛЕННО хотел записаться к конкретному специалисту (назвал ФИО или пришёл по рекомендации к конкретному врачу) — его имя, по возможности из списка сотрудников; иначе пустая строка',\n  is_appointment_booked: 'boolean — состоялась ли запись на приём в этом звонке',\n  appointment_specialist: 'если запись состоялась — к какому специалисту записали, имя строго из списка сотрудников, если удалось сопоставить; иначе как прозвучало',\n  appointment_datetime: 'если запись состоялась — дата и время приёма, как прозвучали в разговоре; иначе пустая строка',\n  city: 'город клиента, ТОЛЬКО если он явно прозвучал в разговоре (клиент сказал откуда он, спрашивал про филиал в городе); иначе пустая строка',\n  referral_source: 'откуда клиент узнал о клинике, ТОЛЬКО если явно прозвучало (2ГИС, интернет, по рекомендации, реклама и т.п.); иначе пустая строка',\n  rule_results: [\n    {\n      rule_id: 'строго один из rule_id из evaluation_rules',\n      score: 'число 1-5 или null если N/A',\n      is_na: 'boolean',\n      reason: 'почему такая оценка',\n      evidence: 'фрагмент или наблюдение из звонка',\n      recommendation: 'что улучшить или сохранить'\n    }\n  ]\n};\n\nconst userPrompt = [\n  'Проанализируй двухканальную запись телефонного разговора оператора клиники TEMED.',\n  '',\n  'Данные звонка:',\n  callMeta,\n  '',\n  'Важно про каналы:',\n  '1. Запись стерео разделена на два канала: left и right.',\n  '2. Один канал обычно содержит речь оператора, второй — речь клиента.',\n  '3. Сначала определи, какой канал вероятнее оператор, а какой клиент.',\n  '4. Если не уверен, укажи unknown и объясни причину.',\n  '5. Оператор обычно представляется, говорит от имени клиники, задает вопросы, предлагает запись или следующий шаг.',\n  '6. Клиент обычно отвечает на вопросы, описывает проблему, сомневается или задает уточняющие вопросы.',\n  '',\n  'Список сотрудников клиники (из Битрикс24):',\n  (Array.isArray(meta.prompts.staff_list) && meta.prompts.staff_list.length\n    ? meta.prompts.staff_list.map(s => '- ' + s.name + (s.position ? ' — ' + s.position : '')).join('\\n')\n    : '(список недоступен — имена специалистов бери из речи как есть)'),\n  '',\n  'Правила оценки evaluation_rules:',\n  JSON.stringify(meta.prompts.evaluation_rules, null, 2),\n  '',\n  'Инструкция:',\n  '1. Оцени звонок по каждому правилу из evaluation_rules.',\n  '2. Для каждого правила верни результат с тем же rule_id.',\n  '3. Не добавляй новых rule_id.',\n  '4. Если правило неприменимо и na_allowed = true, поставь is_na = true и score = null.',\n  '5. Если правило применимо, поставь is_na = false и score от 1 до 5.',\n  '6. Обязательно дай reason, evidence и recommendation.',\n  '7. N/A не участвует в overall_score.',\n  '8. overall_score считай с учетом weight.',\n  '9. Если score <= critical_if_score_lte по любому правилу, problem_level минимум HIGH и is_problem_call = true.',\n  '10. Если score <= problem_if_score_lte по любому правилу, problem_level минимум MEDIUM и is_problem_call = true.',\n  '11. Не проверяй цены, скидки, акции, расписание и коммерческие условия.',\n  '12. Классифицируй звонок: is_target_call = true — обращение потенциального или действующего пациента по вопросам приёма, лечения, записи, переноса, результатов, И клиника в принципе могла дать то, что он хотел. is_target_call = false — мы не могли или не стали удовлетворять запрос: спам/реклама/ошиблись номером (spam), нужной услуги или специалиста у нас нет (no_service), услуга есть, но не в городе клиента (wrong_city), не нашлось подходящего времени в расписании (no_slots), хотел приём в нерабочее время (off_hours), не устроила цена и разговор на этом закончился (price), прочее (other).',\n  '12а. Для нецелевого звонка выбери РОВНО ОДНУ категорию non_target_reason из списка выше и заполни non_target_detail — что именно хотел звонящий.',\n  '12б. Если звонок целевой, но запись не состоялась, заполни no_booking_reason одной категорией: thinking (взял паузу подумать), price (смутила цена, но услугу мы дать могли), info_only (просто узнавал цену/информацию, записываться не собирался), callback (сказал, что перезвонит сам), declined (отказался в ходе диалога), other (прочее). Плюс no_booking_detail свободным текстом. Если запись состоялась — оба поля пустые.',\n  '13. is_primary_patient — строго primary, repeat или unknown. repeat, если есть признаки прошлых визитов (я у вас был, продлить, оператор нашёл карту). primary, если явно новый клиент. unknown, если из разговора не ясно.',\n  '14. requested_specialist — заполняй ТОЛЬКО если клиент целенаправленно хотел записаться к конкретному специалисту: назвал его сам или пришёл по рекомендации именно к нему. Если специалиста предложил оператор — оставь пустым.',\n  '15. is_appointment_booked — true только если в звонке согласованы конкретные дата и время приёма. appointment_specialist и appointment_datetime заполняй из разговора.',\n  '16. Имена специалистов сопоставляй со списком сотрудников: транскрипция может искажать фамилии — выбирай ближайшее по звучанию имя из списка и пиши его в форме из списка. Если уверенного совпадения нет — пиши как прозвучало.',\n  '17. Нецелевой звонок (is_target_call = false) всё равно оцени по правилам, где это осмысленно, остальным ставь N/A если na_allowed, иначе оценивай по факту.',\n  '18. city — заполняй ТОЛЬКО если город клиента явно прозвучал в разговоре. Не угадывай по номеру телефона и не додумывай. Не прозвучало — пустая строка.',\n  '19. referral_source — заполняй ТОЛЬКО если в разговоре прозвучало, откуда клиент узнал о клинике (2ГИС, интернет, сайт, по рекомендации знакомых/врача, реклама). Не прозвучало — пустая строка.',\n  '',\n  'Транскрипт канала left:',\n  transcriptChannels.left,\n  '',\n  'Транскрипт канала right:',\n  transcriptChannels.right,\n  '',\n  'Формат ответа:',\n  meta.prompts.output_schema || JSON.stringify(defaultSchema, null, 2),\n  '',\n  'Обязательно добавь в JSON поле channel_roles.',\n  'Верни только JSON без markdown.'\n].join('\\n');\n\nreturn [\n  {\n    json: {\n      ...meta,\n      transcript_text: transcriptText,\n      transcript_channels: transcriptChannels,\n      systemPrompt,\n      userPrompt\n    }\n  }\n];"
       },
-      "id": "e95b8187-bc99-446a-8513-07eb423f3db8",
+      "id": "bcb72234-ffd2-4d2e-9817-60099693b24f",
       "name": "Build Analysis Request",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
         352,
-        -128
+        -208
       ],
       "onError": "continueErrorOutput"
     },
@@ -269,13 +332,13 @@
         },
         "options": {}
       },
-      "id": "5c6cdb94-0757-4ba7-84c4-ad0671cd7376",
+      "id": "370c081c-3bae-4ff8-9d16-b375e7330b19",
       "name": "gpt-5-mini",
       "type": "@n8n/n8n-nodes-langchain.openAi",
       "typeVersion": 1.8,
       "position": [
-        608,
-        -128
+        576,
+        -288
       ],
       "credentials": {
         "openAiApi": {
@@ -287,15 +350,15 @@
     },
     {
       "parameters": {
-        "jsCode": "const current = $input.first().json;\nconst meta = $items('Build Analysis Request')[0].json;\n\nconst raw =\n  current.message?.content ||\n  current.choices?.[0]?.message?.content ||\n  current.output ||\n  current.text ||\n  current.response ||\n  current.data ||\n  '';\n\nfunction parseJsonSafe(value) {\n  if (typeof value === 'object' && value !== null) return value;\n\n  const s = String(value || '').trim();\n  if (!s) return null;\n\n  try { return JSON.parse(s); } catch (e) {}\n\n  const cleaned = s\n    .replace(/^```json/i, '')\n    .replace(/^```/i, '')\n    .replace(/```$/i, '')\n    .trim();\n\n  try { return JSON.parse(cleaned); } catch (e) {}\n\n  const first = cleaned.indexOf('{');\n  const last = cleaned.lastIndexOf('}');\n\n  if (first !== -1 && last !== -1 && last > first) {\n    try { return JSON.parse(cleaned.slice(first, last + 1)); } catch (e) {}\n  }\n\n  return null;\n}\n\nfunction normalizeProblemLevel(value) {\n  const allowed = ['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];\n  const s = String(value || '').trim().toUpperCase();\n  return allowed.includes(s) ? s : 'NONE';\n}\n\nfunction normalizeBoolean(value) {\n  if (value === true) return true;\n  if (value === false) return false;\n\n  const s = String(value || '').trim().toLowerCase();\n  if (['true', '1', 'yes', 'да', 'истина'].includes(s)) return true;\n  if (['false', '0', 'no', 'нет', 'ложь'].includes(s)) return false;\n\n  return false;\n}\n\nfunction normalizeScore(value) {\n  if (value === null || value === undefined || value === '') return null;\n  const n = Number(value);\n  if (!Number.isFinite(n)) return null;\n  if (n < 1) return 1;\n  if (n > 5) return 5;\n  return n;\n}\n\nfunction asArray(value) {\n  return Array.isArray(value) ? value : [];\n}\n\nlet analysis = parseJsonSafe(raw);\n\nif (!analysis) {\n  analysis = {\n    summary: '',\n    overall_score: null,\n    problem_level: 'HIGH',\n    is_problem_call: true,\n    channel_roles: {\n      left: 'unknown',\n      right: 'unknown',\n      confidence: 'low',\n      reason: 'AI вернул невалидный JSON'\n    },\n    main_strength: '',\n    main_error: 'AI вернул невалидный JSON',\n    recommended_feedback: 'Проверить звонок вручную.',\n    rule_results: [],\n    raw_ai_response: String(raw || '')\n  };\n}\n\nanalysis = {\n  summary: String(analysis.summary || ''),\n  overall_score: normalizeScore(analysis.overall_score),\n  problem_level: normalizeProblemLevel(analysis.problem_level),\n  is_problem_call: normalizeBoolean(analysis.is_problem_call),\n  channel_roles: analysis.channel_roles || {\n    left: 'unknown',\n    right: 'unknown',\n    confidence: 'low',\n    reason: ''\n  },\n  main_strength: String(analysis.main_strength || ''),\n  main_error: String(analysis.main_error || ''),\n  recommended_feedback: String(analysis.recommended_feedback || ''),\n  rule_results: asArray(analysis.rule_results)\n    .map(r => ({\n      rule_id: String(r.rule_id || ''),\n      score: normalizeScore(r.score),\n      is_na: normalizeBoolean(r.is_na),\n      reason: String(r.reason || ''),\n      evidence: String(r.evidence || ''),\n      recommendation: String(r.recommendation || '')\n    }))\n    .filter(r => r.rule_id)\n};\n\n// --- Подготовка записи в Google Sheets --------------------------------\n// Имя листа в A1-нотации всегда берём в одинарные кавычки: в нём есть\n// пробелы и кириллица («Записи звонков»).\nfunction quoteSheetName(name) {\n  return `'${String(name || '').replace(/'/g, \"''\")}'`;\n}\n\n// Лимит одной ячейки Google Sheets — 50 000 символов.\nconst MAX_CELL_LENGTH = 45000;\n\nfunction cellText(value) {\n  const s = String(value === null || value === undefined ? '' : value);\n  return s.length > MAX_CELL_LENGTH\n    ? `${s.slice(0, MAX_CELL_LENGTH)}…[обрезано]`\n    : s;\n}\n\nconst receivedAt = $now.toFormat('yyyy-MM-dd HH:mm:ss');\n\nconst values = {\n  transcription_received_at: receivedAt,\n  transcription_error: '',\n  transcript_text: cellText(meta.transcript_text),\n  transcript_left: cellText(meta.transcript_channels?.left),\n  transcript_right: cellText(meta.transcript_channels?.right),\n  summary: cellText(analysis.summary),\n  overall_score: analysis.overall_score === null ? '' : analysis.overall_score,\n  problem_level: analysis.problem_level,\n  is_problem_call: analysis.is_problem_call ? 'TRUE' : 'FALSE',\n  main_strength: cellText(analysis.main_strength),\n  main_error: cellText(analysis.main_error),\n  recommended_feedback: cellText(analysis.recommended_feedback),\n  rule_results_json: cellText(JSON.stringify(analysis.rule_results)),\n  prompt_version: meta.prompt_version || meta.prompts?.prompt_version || '',\n  transcription_n8n_execution_id: String($execution.id)\n};\n\nconst fields = Array.isArray(meta.result_fields) && meta.result_fields.length\n  ? meta.result_fields\n  : Object.keys(values);\n\nconst withoutValue = fields.filter(f => values[f] === undefined);\n\nif (withoutValue.length) {\n  throw new Error(`No value prepared for result fields: ${withoutValue.join(', ')}`);\n}\n\nconst withoutColumn = fields.filter(f => !meta.result_columns?.[f]);\n\nif (withoutColumn.length) {\n  throw new Error(`No column letter for result fields: ${withoutColumn.join(', ')}`);\n}\n\nconst sheetPrefix = quoteSheetName(meta.sheet_name);\n\nconst sheetUpdates = fields.map(field => ({\n  field,\n  range: `${sheetPrefix}!${meta.result_columns[field]}${meta.row_number}`,\n  value: values[field]\n}));\n\nreturn [\n  {\n    json: {\n      call_key: meta.call_key,\n\n      spreadsheet_id: meta.spreadsheet_id,\n      sheet_name: meta.sheet_name,\n      row_number: meta.row_number,\n\n      sheetUpdates,\n\n      // Одним запросом: values:batchUpdate вместо записи по одной ячейке.\n      batchBody: {\n        valueInputOption: 'RAW',\n        data: sheetUpdates.map(u => ({ range: u.range, values: [[u.value]] }))\n      },\n\n      analysis,\n      temp: meta.temp\n    }\n  }\n];\n"
+        "jsCode": "const current = $input.first().json;\nconst meta = $items('Build Analysis Request')[0].json;\n\nconst raw =\n  current.message?.content ||\n  current.choices?.[0]?.message?.content ||\n  current.output ||\n  current.text ||\n  current.response ||\n  current.data ||\n  '';\n\nfunction parseJsonSafe(value) {\n  if (typeof value === 'object' && value !== null) return value;\n\n  const s = String(value || '').trim();\n  if (!s) return null;\n\n  try { return JSON.parse(s); } catch (e) {}\n\n  const cleaned = s\n    .replace(/^```json/i, '')\n    .replace(/^```/i, '')\n    .replace(/```$/i, '')\n    .trim();\n\n  try { return JSON.parse(cleaned); } catch (e) {}\n\n  const first = cleaned.indexOf('{');\n  const last = cleaned.lastIndexOf('}');\n\n  if (first !== -1 && last !== -1 && last > first) {\n    try { return JSON.parse(cleaned.slice(first, last + 1)); } catch (e) {}\n  }\n\n  return null;\n}\n\nfunction normalizeProblemLevel(value) {\n  const allowed = ['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];\n  const s = String(value || '').trim().toUpperCase();\n  return allowed.includes(s) ? s : 'NONE';\n}\n\nfunction normalizeBoolean(value) {\n  if (value === true) return true;\n  if (value === false) return false;\n\n  const s = String(value || '').trim().toLowerCase();\n  if (['true', '1', 'yes', 'да', 'истина'].includes(s)) return true;\n  if (['false', '0', 'no', 'нет', 'ложь'].includes(s)) return false;\n\n  return false;\n}\n\nfunction normalizeEnum(value, allowed, fallback) {\n  const s = String(value || '').trim().toLowerCase();\n  return allowed.includes(s) ? s : fallback;\n}\n\nfunction normalizeScore(value) {\n  if (value === null || value === undefined || value === '') return null;\n  const n = Number(value);\n  if (!Number.isFinite(n)) return null;\n  if (n < 1) return 1;\n  if (n > 5) return 5;\n  return n;\n}\n\nfunction asArray(value) {\n  return Array.isArray(value) ? value : [];\n}\n\nlet analysis = parseJsonSafe(raw);\n\nif (!analysis) {\n  analysis = {\n    summary: '',\n    overall_score: null,\n    problem_level: 'HIGH',\n    is_problem_call: true,\n    channel_roles: {\n      left: 'unknown',\n      right: 'unknown',\n      confidence: 'low',\n      reason: 'AI вернул невалидный JSON'\n    },\n    main_strength: '',\n    main_error: 'AI вернул невалидный JSON',\n    recommended_feedback: 'Проверить звонок вручную.',\n    rule_results: [],\n    raw_ai_response: String(raw || '')\n  };\n}\n\nanalysis = {\n  summary: String(analysis.summary || ''),\n  overall_score: normalizeScore(analysis.overall_score),\n  problem_level: normalizeProblemLevel(analysis.problem_level),\n  is_problem_call: normalizeBoolean(analysis.is_problem_call),\n  channel_roles: analysis.channel_roles || {\n    left: 'unknown',\n    right: 'unknown',\n    confidence: 'low',\n    reason: ''\n  },\n  main_strength: String(analysis.main_strength || ''),\n  main_error: String(analysis.main_error || ''),\n  recommended_feedback: String(analysis.recommended_feedback || ''),\n  is_target_call: normalizeBoolean(analysis.is_target_call),\n  non_target_reason: normalizeEnum(\n    analysis.non_target_reason,\n    ['spam', 'no_service', 'wrong_city', 'no_slots', 'off_hours', 'price', 'other'],\n    ''\n  ),\n  non_target_detail: String(analysis.non_target_detail || ''),\n  no_booking_reason: normalizeEnum(\n    analysis.no_booking_reason,\n    ['thinking', 'price', 'info_only', 'callback', 'declined', 'other'],\n    ''\n  ),\n  no_booking_detail: String(analysis.no_booking_detail || ''),\n  is_primary_patient: normalizeEnum(\n    analysis.is_primary_patient,\n    ['primary', 'repeat', 'unknown'],\n    'unknown'\n  ),\n  requested_specialist: String(analysis.requested_specialist || ''),\n  is_appointment_booked: normalizeBoolean(analysis.is_appointment_booked),\n  appointment_specialist: String(analysis.appointment_specialist || ''),\n  appointment_datetime: String(analysis.appointment_datetime || ''),\n  city: String(analysis.city || ''),\n  referral_source: String(analysis.referral_source || ''),\n  rule_results: asArray(analysis.rule_results)\n    .map(r => ({\n      rule_id: String(r.rule_id || ''),\n      score: normalizeScore(r.score),\n      is_na: normalizeBoolean(r.is_na),\n      reason: String(r.reason || ''),\n      evidence: String(r.evidence || ''),\n      recommendation: String(r.recommendation || '')\n    }))\n    .filter(r => r.rule_id)\n};\n\n// --- Подготовка записи в Google Sheets --------------------------------\n// Имя листа в A1-нотации всегда берём в одинарные кавычки: в нём есть\n// пробелы и кириллица («Записи звонков»).\nfunction quoteSheetName(name) {\n  return `'${String(name || '').replace(/'/g, \"''\")}'`;\n}\n\n// Лимит одной ячейки Google Sheets — 50 000 символов.\nconst MAX_CELL_LENGTH = 45000;\n\nfunction cellText(value) {\n  const s = String(value === null || value === undefined ? '' : value);\n  return s.length > MAX_CELL_LENGTH\n    ? `${s.slice(0, MAX_CELL_LENGTH)}…[обрезано]`\n    : s;\n}\n\nconst receivedAt = $now.toFormat('yyyy-MM-dd HH:mm:ss');\n\nconst values = {\n  transcription_received_at: receivedAt,\n  transcription_error: '',\n  transcript_text: cellText(meta.transcript_text),\n  transcript_left: cellText(meta.transcript_channels?.left),\n  transcript_right: cellText(meta.transcript_channels?.right),\n  summary: cellText(analysis.summary),\n  overall_score: analysis.overall_score === null ? '' : analysis.overall_score,\n  problem_level: analysis.problem_level,\n  is_problem_call: analysis.is_problem_call ? 'TRUE' : 'FALSE',\n  main_strength: cellText(analysis.main_strength),\n  main_error: cellText(analysis.main_error),\n  recommended_feedback: cellText(analysis.recommended_feedback),\n  is_target_call: analysis.is_target_call ? 'TRUE' : 'FALSE',\n  non_target_reason: cellText(analysis.non_target_reason),\n  non_target_detail: cellText(analysis.non_target_detail),\n  no_booking_reason: cellText(analysis.no_booking_reason),\n  no_booking_detail: cellText(analysis.no_booking_detail),\n  is_primary_patient: cellText(analysis.is_primary_patient),\n  requested_specialist: cellText(analysis.requested_specialist),\n  is_appointment_booked: analysis.is_appointment_booked ? 'TRUE' : 'FALSE',\n  appointment_specialist: cellText(analysis.appointment_specialist),\n  appointment_datetime: cellText(analysis.appointment_datetime),\n  city: cellText(analysis.city),\n  referral_source: cellText(analysis.referral_source),\n  rule_results_json: cellText(JSON.stringify(analysis.rule_results)),\n  prompt_version: meta.prompt_version || meta.prompts?.prompt_version || '',\n  transcription_n8n_execution_id: String($execution.id)\n};\n\nconst fields = Array.isArray(meta.result_fields) && meta.result_fields.length\n  ? meta.result_fields\n  : Object.keys(values);\n\nconst withoutValue = fields.filter(f => values[f] === undefined);\n\nif (withoutValue.length) {\n  throw new Error(`No value prepared for result fields: ${withoutValue.join(', ')}`);\n}\n\nconst withoutColumn = fields.filter(f => !meta.result_columns?.[f]);\n\nif (withoutColumn.length) {\n  throw new Error(`No column letter for result fields: ${withoutColumn.join(', ')}`);\n}\n\nconst sheetPrefix = quoteSheetName(meta.sheet_name);\n\nconst sheetUpdates = fields.map(field => ({\n  field,\n  range: `${sheetPrefix}!${meta.result_columns[field]}${meta.row_number}`,\n  value: values[field]\n}));\n\nreturn [\n  {\n    json: {\n      call_key: meta.call_key,\n\n      spreadsheet_id: meta.spreadsheet_id,\n      sheet_name: meta.sheet_name,\n      row_number: meta.row_number,\n\n      sheetUpdates,\n\n      // Одним запросом: values:batchUpdate вместо записи по одной ячейке.\n      batchBody: {\n        valueInputOption: 'RAW',\n        data: sheetUpdates.map(u => ({ range: u.range, values: [[u.value]] }))\n      },\n\n      analysis,\n      temp: meta.temp\n    }\n  }\n];\n"
       },
-      "id": "519e7824-fb6c-4fab-9212-a45fed716045",
+      "id": "e2331a80-7e29-4b03-9b4a-a786b650b100",
       "name": "Prepare Sheet Update",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        880,
-        -128
+        928,
+        -352
       ],
       "onError": "continueErrorOutput"
     },
@@ -310,27 +373,33 @@
         "jsonBody": "={{ JSON.stringify($json.batchBody) }}",
         "options": {}
       },
-      "id": "a495d952-ec02-4858-9423-47a1db8d58f2",
+      "id": "1b3a58a1-78d3-4518-8aaa-1d618fa7155c",
       "name": "Write Result To Sheet",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        1136,
-        -128
+        1376,
+        -400
       ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "j68oP4jTpcKIyBYP",
+          "name": "Google Sheets [ n8n.temed ]"
+        }
+      },
       "notes": "Один запрос values:batchUpdate на всю строку результата. Credential: Google с доступом к Sheets (scope https://www.googleapis.com/auth/spreadsheets). Если используется сервисный аккаунт (тот же, что для Google Drive) — выберите Predefined Credential Type = Google API и добавьте этот scope в credential; сервисному аккаунту нужен доступ на редактирование самой таблицы."
     },
     {
       "parameters": {
         "jsCode": "// Общая ветка ошибок: сюда приходит error-выход любой ноды обработки.\n// Пишем только transcription_error и transcription_received_at —\n// остальные колонки строки не трогаем.\nconst meta = $items('Normalize Incoming Payload')[0].json;\nconst item = $input.first();\nconst json = item.json || {};\n\nconst rawError = json.error !== undefined ? json.error : json;\n\nfunction errorText(value) {\n  if (!value) return 'Unknown error';\n  if (typeof value === 'string') return value;\n\n  const parts = [];\n\n  if (value.message) parts.push(String(value.message));\n  if (value.description && value.description !== value.message) {\n    parts.push(String(value.description));\n  }\n\n  if (parts.length) return parts.join(' — ');\n\n  try {\n    return JSON.stringify(value).slice(0, 1500);\n  } catch (e) {\n    return String(value);\n  }\n}\n\nconst failedNode =\n  json.error?.node?.name ||\n  json.node?.name ||\n  json.lastNodeExecuted ||\n  '';\n\nconst message = [\n  `n8n execution ${$execution.id}`,\n  failedNode ? `нода «${failedNode}»` : '',\n  errorText(rawError)\n].filter(Boolean).join(': ');\n\nfunction quoteSheetName(name) {\n  return `'${String(name || '').replace(/'/g, \"''\")}'`;\n}\n\nconst MAX_CELL_LENGTH = 45000;\n\nconst values = {\n  transcription_error: message.length > MAX_CELL_LENGTH\n    ? `${message.slice(0, MAX_CELL_LENGTH)}…[обрезано]`\n    : message,\n  transcription_received_at: $now.toFormat('yyyy-MM-dd HH:mm:ss')\n};\n\nconst sheetPrefix = quoteSheetName(meta.sheet_name);\n\nconst sheetUpdates = Object.keys(values)\n  .filter(field => meta.result_columns?.[field])\n  .map(field => ({\n    field,\n    range: `${sheetPrefix}!${meta.result_columns[field]}${meta.row_number}`,\n    value: values[field]\n  }));\n\nif (!sheetUpdates.length) {\n  throw new Error('No result_columns for transcription_error / transcription_received_at');\n}\n\nreturn [\n  {\n    json: {\n      call_key: meta.call_key,\n\n      spreadsheet_id: meta.spreadsheet_id,\n      sheet_name: meta.sheet_name,\n      row_number: meta.row_number,\n\n      failed_node: failedNode,\n      error_message: message,\n\n      sheetUpdates,\n\n      batchBody: {\n        valueInputOption: 'RAW',\n        data: sheetUpdates.map(u => ({ range: u.range, values: [[u.value]] }))\n      },\n\n      temp: meta.temp\n    }\n  }\n];\n"
       },
-      "id": "0a6f1c47-6d2b-4a4c-9a2c-6f5f2c1c9a10",
+      "id": "4a5374af-2097-43b2-92e5-ae1b902afe6c",
       "name": "Prepare Error Update",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        880,
-        320
+        1152,
+        560
       ],
       "notes": "Единая ветка ошибок: пишет transcription_error и transcription_received_at в те же координаты строки, остальные колонки не трогает."
     },
@@ -345,30 +414,51 @@
         "jsonBody": "={{ JSON.stringify($json.batchBody) }}",
         "options": {}
       },
-      "id": "3c1f0a92-77b0-4a5e-8f0b-2d9a4b7c1e33",
+      "id": "9212460d-8443-4ba4-8fa8-80f32b746597",
       "name": "Write Error To Sheet",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        1136,
-        320
+        1376,
+        560
       ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "j68oP4jTpcKIyBYP",
+          "name": "Google Sheets [ n8n.temed ]"
+        }
+      },
       "notes": "Один запрос values:batchUpdate на всю строку результата. Credential: Google с доступом к Sheets (scope https://www.googleapis.com/auth/spreadsheets). Если используется сервисный аккаунт (тот же, что для Google Drive) — выберите Predefined Credential Type = Google API и добавьте этот scope в credential; сервисному аккаунту нужен доступ на редактирование самой таблицы."
     },
     {
       "parameters": {
         "command": "=rm -f '{{ $items(\"Normalize Incoming Payload\")[0].json.temp.inputPath }}' '{{ $items(\"Normalize Incoming Payload\")[0].json.temp.leftPath }}' '{{ $items(\"Normalize Incoming Payload\")[0].json.temp.rightPath }}' '{{ $items(\"Normalize Incoming Payload\")[0].json.temp.splitLogPath }}'"
       },
-      "id": "8ecf4209-e9b8-476d-b8dc-387921abe46e",
+      "id": "3f97d9c6-a41b-4f59-bdcf-185dd5f410a8",
       "name": "Cleanup Temp Files",
       "type": "n8n-nodes-base.executeCommand",
       "typeVersion": 1,
       "position": [
-        1392,
-        -128
+        1600,
+        160
       ],
       "onError": "continueRegularOutput",
       "notes": "Выполняется и при успехе, и в ветке ошибки. Пути берутся из Normalize Incoming Payload — эта нода отрабатывает всегда."
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        -544,
+        80
+      ],
+      "id": "7e073b35-068f-4fce-93e4-9005a3ec5a8a",
+      "name": "Merge Audio Channels"
     }
   ],
   "connections": {
@@ -493,7 +583,7 @@
       "main": [
         [
           {
-            "node": "OpenAI - Transcribe left",
+            "node": "Merge Audio Channels",
             "type": "main",
             "index": 0
           }
@@ -547,9 +637,9 @@
       "main": [
         [
           {
-            "node": "OpenAI - Transcribe right",
+            "node": "Merge Audio Channels",
             "type": "main",
-            "index": 0
+            "index": 1
           }
         ],
         [
@@ -689,6 +779,22 @@
         [
           {
             "node": "Cleanup Temp Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Audio Channels": {
+      "main": [
+        [
+          {
+            "node": "OpenAI - Transcribe left",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "OpenAI - Transcribe right",
             "type": "main",
             "index": 0
           }

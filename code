@@ -80,6 +80,18 @@ const HEADERS = [
   'main_strength',
   'main_error',
   'recommended_feedback',
+  'is_target_call',
+  'non_target_reason',
+  'non_target_detail',
+  'no_booking_reason',
+  'no_booking_detail',
+  'is_primary_patient',
+  'requested_specialist',
+  'is_appointment_booked',
+  'appointment_specialist',
+  'appointment_datetime',
+  'city',
+  'referral_source',
   'rule_results_json',
   'prompt_version',
   'transcription_n8n_execution_id'
@@ -109,6 +121,18 @@ const RESULT_HEADERS = [
   'main_strength',
   'main_error',
   'recommended_feedback',
+  'is_target_call',
+  'non_target_reason',
+  'non_target_detail',
+  'no_booking_reason',
+  'no_booking_detail',
+  'is_primary_patient',
+  'requested_specialist',
+  'is_appointment_booked',
+  'appointment_specialist',
+  'appointment_datetime',
+  'city',
+  'referral_source',
   'rule_results_json',
   'prompt_version',
   'transcription_n8n_execution_id'
@@ -517,6 +541,10 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
         (prompts.prompt_version || '(не задана)') + '», правил: ' + prompts.evaluation_rules.length +
         ', analysis_system_prompt: ' + (prompts.analysis_system_prompt ? 'задан' : 'по умолчанию из n8n')
     );
+
+    // Список сотрудников из Битрикс — в prompts, чтобы уехал в n8n
+    // вместе с остальными промптами. Ошибка Битрикс отправку не блокирует.
+    prompts.staff_list = loadBitrixStaffSafe_(push);
 
     const sheet = getOrCreateSheet_();
     ensureHeaders_(sheet);
@@ -1391,6 +1419,113 @@ function createDefaultPromptsSheet_() {
   sheet.setColumnWidth(3, 420);
 
   return sheet;
+}
+
+
+/************************************************************
+ * СОТРУДНИКИ ИЗ БИТРИКС24
+ *
+ * Свойство скрипта BITRIX_WEBHOOK_BASE_URL — базовый URL входящего
+ * вебхука Битрикс24 вида:
+ *   https://portal.bitrix24.ru/rest/USER_ID/TOKEN
+ * Скрипт вызывает {BASE}/user.get.json (только активные пользователи)
+ * и передаёт список в payload как prompts.staff_list:
+ *   [{ name: 'Фамилия Имя Отчество', position: 'Должность' }, ...]
+ *
+ * Список кэшируется на 6 часов. Недоступность Битрикс НЕ блокирует
+ * отправку: в этом случае staff_list пустой, а в лог пишется WARN.
+ ************************************************************/
+
+const BITRIX_STAFF_CACHE_KEY = 'bitrix_staff_v1';
+const BITRIX_STAFF_CACHE_SECONDS = 21600; // 6 часов — максимум CacheService
+
+function loadBitrixStaff_() {
+  const base = PropertiesService.getScriptProperties().getProperty('BITRIX_WEBHOOK_BASE_URL');
+
+  if (!base) {
+    throw new Error(
+      'Свойство скрипта BITRIX_WEBHOOK_BASE_URL не задано ' +
+      '(Настройки проекта → Свойства скрипта).'
+    );
+  }
+
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get(BITRIX_STAFF_CACHE_KEY);
+
+  if (cached) return JSON.parse(cached);
+
+  const baseUrl = String(base).replace(/\/+$/, '');
+  const staff = [];
+  let start = 0;
+
+  for (let page = 0; page < 40; page++) {
+    const url = baseUrl + '/user.get.json?ACTIVE=true&start=' + start;
+    const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    const code = response.getResponseCode();
+
+    if (code !== 200) {
+      throw new Error(
+        'Bitrix user.get вернул HTTP ' + code + ': ' +
+        String(response.getContentText()).slice(0, 300)
+      );
+    }
+
+    const data = JSON.parse(response.getContentText());
+
+    if (data.error) {
+      throw new Error('Bitrix user.get: ' + data.error + ' — ' + (data.error_description || ''));
+    }
+
+    (data.result || []).forEach(function(user) {
+      const name = [user.LAST_NAME, user.NAME, user.SECOND_NAME]
+        .map(function(part) { return String(part || '').trim(); })
+        .filter(Boolean)
+        .join(' ');
+
+      if (!name) return;
+
+      staff.push({
+        name: name,
+        position: String(user.WORK_POSITION || '').trim()
+      });
+    });
+
+    if (data.next === undefined || data.next === null) break;
+
+    start = data.next;
+  }
+
+  const serialized = JSON.stringify(staff);
+
+  // Лимит CacheService — 100 КБ на ключ; слишком большой список не кэшируем.
+  if (serialized.length < 90000) {
+    cache.put(BITRIX_STAFF_CACHE_KEY, serialized, BITRIX_STAFF_CACHE_SECONDS);
+  }
+
+  return staff;
+}
+
+/**
+ * Безопасная обёртка: ошибка Битрикс не отменяет отправку.
+ */
+function loadBitrixStaffSafe_(push) {
+  try {
+    const staff = loadBitrixStaff_();
+
+    push('BITRIX_STAFF', '', 'Сотрудники из Битрикс загружены: ' + staff.length + ' чел.');
+
+    return staff;
+  } catch (e) {
+    push(
+      'BITRIX_STAFF_WARN',
+      '',
+      'Сотрудники из Битрикс НЕ загружены (' + String((e && e.message) || e) +
+        '). Отправка продолжается без списка сотрудников: ' +
+        'appointment_specialist будет определяться только из речи.'
+    );
+
+    return [];
+  }
 }
 
 /************************************************************

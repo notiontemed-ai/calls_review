@@ -27,6 +27,10 @@ const CONFIG = {
   PROMPTS_SHEET_NAME: 'Промпты',
   EMPLOYEES_SHEET_NAME: 'Сотрудники',
 
+  // Ручной маппинг «как Mango пишет оператора» → «ФИО сотрудника».
+  // Лист ведёт пользователь: скрипт его только читает.
+  OPERATORS_SHEET_NAME: 'Операторы',
+
   MAX_FILES_PER_RUN: 500,
   MAX_SEND_PER_RUN: 50,
   MAX_LOG_ROWS: 20000,
@@ -53,16 +57,10 @@ const HEADERS = [
   'client_phone',
   'mango_side',
   'line_name',
+  // operator_name — итог матчинга по листам «Операторы» и «Сотрудники»
+  // (его делает скан). Служебных operator-колонок на листе нет: аудит
+  // матчинга виден в «Логе», событие EMPLOYEE_MATCH_OPERATOR.
   'operator_name',
-
-  // Матчинг оператора по листу «Сотрудники» (заполняет скрипт при скане).
-  // operator_name_raw — то, что дал Mango; operator_name перезаписывается
-  // полным ФИО из справочника только при надёжном совпадении.
-  'operator_name_raw',
-  'operator_name_bitrix',
-  'operator_bitrix_user_id',
-  'operator_match_status',
-  'operator_match_comment',
 
   'drive_file_id',
   'drive_url',
@@ -80,6 +78,8 @@ const HEADERS = [
   // Колонки результата (их заполняет n8n) — см. RESULT_HEADERS
   'transcription_received_at',
   'transcription_error',
+  'call_duration_seconds',
+  'call_duration',
   'transcript_text',
   'transcript_left',
   'transcript_right',
@@ -96,13 +96,17 @@ const HEADERS = [
   'no_booking_reason',
   'no_booking_detail',
   'is_primary_patient',
-  'requested_specialist',
   'requested_specialist_raw',
+  'requested_specialist',
   'requested_specialist_bitrix_user_id',
   'requested_specialist_match_status',
   'requested_specialist_match_comment',
   'is_appointment_booked',
+  'appointment_specialist_raw',
   'appointment_specialist',
+  'appointment_specialist_bitrix_user_id',
+  'appointment_specialist_match_status',
+  'appointment_specialist_match_comment',
   'appointment_datetime',
   'city',
   'referral_source',
@@ -125,6 +129,8 @@ const HEADERS = [
 const RESULT_HEADERS = [
   'transcription_received_at',
   'transcription_error',
+  'call_duration_seconds',
+  'call_duration',
   'transcript_text',
   'transcript_left',
   'transcript_right',
@@ -141,13 +147,17 @@ const RESULT_HEADERS = [
   'no_booking_reason',
   'no_booking_detail',
   'is_primary_patient',
-  'requested_specialist',
   'requested_specialist_raw',
+  'requested_specialist',
   'requested_specialist_bitrix_user_id',
   'requested_specialist_match_status',
   'requested_specialist_match_comment',
   'is_appointment_booked',
+  'appointment_specialist_raw',
   'appointment_specialist',
+  'appointment_specialist_bitrix_user_id',
+  'appointment_specialist_match_status',
+  'appointment_specialist_match_comment',
   'appointment_datetime',
   'city',
   'referral_source',
@@ -307,6 +317,9 @@ function scanMangoRecordingsFolder() {
     // оператора идёт по листу «Сотрудники», без обращений в Битрикс.
     const employees = loadEmployeesFromSheet_(push);
 
+    // Ручной маппинг «Операторы»: он авторитетнее автоматического матчинга.
+    const operatorMapping = loadOperatorMapping_(push);
+
     push('EMPLOYEES', '', 'Справочник сотрудников: ' + employees.length + ' записей');
 
     const rootFolder = DriveApp.getFolderById(CONFIG.SOURCE_FOLDER_ID);
@@ -410,18 +423,27 @@ function scanMangoRecordingsFolder() {
 
           const now = nowString_();
 
-          // Матчинг оператора по листу «Сотрудники». Подстановка полного ФИО
-          // разрешена только при надёжном совпадении; иначе в operator_name
-          // остаётся то, что дал Mango, а причина видна в *_match_*.
-          const operatorMatch = matchEmployeeByName_(parsed.operator_name, employees);
+          // Матчинг оператора. Сначала ручной маппинг листа «Операторы»
+          // (он авторитетен), иначе — то, что извлеклось из имени файла.
+          // Подстановка полного ФИО из справочника разрешена только при
+          // надёжном совпадении; иначе в operator_name остаётся исходное
+          // значение, а причина видна в «Логе».
+          const mapped = operatorMapping[normalizeFio_(parsed.mango_side)] || '';
+          const operatorInput = mapped || parsed.operator_name;
+
+          const operatorMatch = matchEmployeeByName_(operatorInput, employees);
           const operatorMatched = isConfidentEmployeeMatch_(operatorMatch.status);
 
           push(
             'EMPLOYEE_MATCH_OPERATOR',
             filenameFixed,
-            'raw="' + parsed.operator_name + '", status=' + operatorMatch.status +
+            'raw="' + operatorInput + '", status=' + operatorMatch.status +
               ', bitrix="' + operatorMatch.full_name + '", id=' + operatorMatch.bitrix_user_id +
-              (operatorMatch.comment ? ', comment=' + operatorMatch.comment : '')
+              (operatorMatch.comment ? ', comment=' + operatorMatch.comment : '') +
+              (mapped
+                ? ', ручное сопоставление (лист «' + CONFIG.OPERATORS_SHEET_NAME + '»): ' +
+                  parsed.mango_side + ' → ' + mapped
+                : '')
           );
 
           const rowObj = {
@@ -437,13 +459,7 @@ function scanMangoRecordingsFolder() {
             client_phone: parsed.client_phone,
             mango_side: parsed.mango_side,
             line_name: parsed.line_name,
-            operator_name: operatorMatched ? operatorMatch.full_name : parsed.operator_name,
-
-            operator_name_raw: parsed.operator_name,
-            operator_name_bitrix: operatorMatched ? operatorMatch.full_name : '',
-            operator_bitrix_user_id: operatorMatched ? operatorMatch.bitrix_user_id : '',
-            operator_match_status: operatorMatch.status,
-            operator_match_comment: operatorMatch.comment,
+            operator_name: operatorMatched ? operatorMatch.full_name : operatorInput,
 
             drive_file_id: file.getId(),
             drive_url: file.getUrl(),
@@ -761,7 +777,7 @@ function sendTranscriptionRow_(sheet, rowNumber, row, headerMap, push) {
   // и закэшированы, поэтому лист «Промпты» читается один раз за запуск.
   const prompts = loadPrompts_();
 
-  // Снимок справочника для матчинга requested_specialist в n8n.
+  // Снимок справочника для матчинга специалистов в n8n.
   // Лист уже прочитан в начале отправки — здесь отдаётся кэш рана.
   const employees = buildEmployeesPayload_(loadEmployeesFromSheet_(log));
 
@@ -787,20 +803,15 @@ function sendTranscriptionRow_(sheet, rowNumber, row, headerMap, push) {
     client_phone: getCellByHeader_(row, headerMap, 'client_phone'),
     mango_side: getCellByHeader_(row, headerMap, 'mango_side'),
     line_name: getCellByHeader_(row, headerMap, 'line_name'),
+    // Оператор уже итоговый: матчинг выполнил скан, n8n его не пересчитывает.
     operator_name: getCellByHeader_(row, headerMap, 'operator_name'),
-
-    // Результат матчинга оператора (его выполнил скан) — n8n использует его
-    // как есть и заново не считает.
-    operator_name_raw: getCellByHeader_(row, headerMap, 'operator_name_raw'),
-    operator_name_bitrix: getCellByHeader_(row, headerMap, 'operator_name_bitrix'),
-    operator_bitrix_user_id: getCellByHeader_(row, headerMap, 'operator_bitrix_user_id'),
-    operator_match_status: getCellByHeader_(row, headerMap, 'operator_match_status'),
 
     drive_file_id: getCellByHeader_(row, headerMap, 'drive_file_id'),
     drive_url: getCellByHeader_(row, headerMap, 'drive_url'),
 
-    // Справочник сотрудников для матчинга requested_specialist в n8n.
-    // AI список НЕ получает: сопоставление идёт кодом по этому снимку.
+    // Справочник сотрудников для матчинга requested_specialist и
+    // appointment_specialist в n8n. AI список НЕ получает: сопоставление
+    // идёт кодом по этому снимку.
     employees: employees,
 
     // Результат n8n пишет в таблицу сам, поэтому callback не передаётся.
@@ -1504,9 +1515,11 @@ function createDefaultPromptsSheet_() {
  * (пункт меню или ночной триггер); в момент матчинга в Битрикс не ходим.
  *
  * Кто чем пользуется:
- *   • ФИО оператора матчит скан (scanMangoRecordingsFolder) по этому листу;
- *   • requested_specialist матчит n8n — снимок листа уезжает в payload
- *     как employees, потому что результат n8n пишет в таблицу напрямую.
+ *   • ФИО оператора матчит скан (scanMangoRecordingsFolder) по этому листу,
+ *     с учётом ручного маппинга на листе «Операторы»;
+ *   • requested_specialist и appointment_specialist матчит n8n — снимок
+ *     листа уезжает в payload как employees, потому что результат n8n
+ *     пишет в таблицу напрямую.
  *
  * AI список сотрудников НЕ получает и ФИО не сопоставляет: свободная
  * генерация модели не источник истины для фамилий.
@@ -1523,6 +1536,7 @@ const EMPLOYEES_HEADERS = [
   'short_name',
   'short_name_normalized',
   'last_name_normalized',
+  'name_patronymic_normalized',
   'work_position',
   'department_ids',
   'updated_at'
@@ -1537,8 +1551,16 @@ const EMPLOYEES_LOCK_TIMEOUT_MS = 30000;
 
 const EMPLOYEES_TRIGGER_HANDLER = 'refreshEmployeesFromBitrix';
 
+// Заголовки листа «Операторы» (ручной маппинг). Лист ведёт пользователь,
+// скрипт его только читает.
+const OPERATORS_KEY_HEADER = 'mango_side';
+const OPERATORS_VALUE_HEADER = 'Сотрудник';
+
 // Кэш на время одного выполнения скрипта: лист читается один раз.
 let EMPLOYEES_CACHE_ = null;
+
+// Кэш ручного маппинга операторов — тоже один раз за ран.
+let OPERATOR_MAPPING_CACHE_ = null;
 
 /************************************************************
  * ОБНОВЛЕНИЕ ЛИСТА ИЗ БИТРИКС24
@@ -1708,6 +1730,10 @@ function buildEmployeeFromBitrixUser_(user, updatedAt) {
 
   const shortName = lastName && initials ? lastName + ' ' + initials : lastName;
 
+  // «Имя Отчество» — так специалиста часто называют в разговоре.
+  // Без имени формы нет: одно отчество никого не идентифицирует.
+  const namePatronymic = firstName ? [firstName, secondName].filter(Boolean).join(' ') : '';
+
   const departments = user && user.UF_DEPARTMENT;
 
   return {
@@ -1721,6 +1747,7 @@ function buildEmployeeFromBitrixUser_(user, updatedAt) {
     short_name: shortName,
     short_name_normalized: normalizeFio_(shortName),
     last_name_normalized: normalizeFio_(lastName),
+    name_patronymic_normalized: normalizeFio_(namePatronymic),
     work_position: String((user && user.WORK_POSITION) || '').trim(),
     department_ids: Array.isArray(departments)
       ? departments.join(',')
@@ -1747,6 +1774,11 @@ function writeEmployeesSheet_(rows) {
   }
 }
 
+/**
+ * Лист-снимок целиком принадлежит скрипту, поэтому шапка пишется жёстко
+ * в A1 (append-логика ensureSheetHeaders_ здесь не годится: мусор в A1
+ * сдвинул бы все колонки). Лишние колонки справа очищаются.
+ */
 function getOrCreateEmployeesSheet_() {
   const ss = SpreadsheetApp.getActive();
   let sheet = ss.getSheetByName(CONFIG.EMPLOYEES_SHEET_NAME);
@@ -1755,7 +1787,17 @@ function getOrCreateEmployeesSheet_() {
     sheet = ss.insertSheet(CONFIG.EMPLOYEES_SHEET_NAME);
   }
 
-  ensureSheetHeaders_(sheet, EMPLOYEES_HEADERS);
+  ensureSheetColumnCount_(sheet, EMPLOYEES_HEADERS.length);
+
+  sheet.getRange(1, 1, 1, EMPLOYEES_HEADERS.length).setValues([EMPLOYEES_HEADERS]);
+
+  const extraColumns = sheet.getMaxColumns() - EMPLOYEES_HEADERS.length;
+
+  if (extraColumns > 0) {
+    sheet.getRange(1, EMPLOYEES_HEADERS.length + 1, sheet.getMaxRows(), extraColumns).clearContent();
+  }
+
+  sheet.setFrozenRows(1);
 
   return sheet;
 }
@@ -1886,6 +1928,12 @@ function loadEmployeesFromSheet_(push) {
       employee.last_name_normalized = normalizeFio_(employee.last_name);
     }
 
+    if (!employee.name_patronymic_normalized && employee.name) {
+      employee.name_patronymic_normalized = normalizeFio_(
+        [employee.name, employee.second_name].filter(Boolean).join(' ')
+      );
+    }
+
     employees.push(employee);
   });
 
@@ -1914,10 +1962,95 @@ function buildEmployeesPayload_(employees) {
       full_name: employee.full_name,
       full_name_normalized: employee.full_name_normalized,
       short_name_normalized: employee.short_name_normalized,
+      name_patronymic_normalized: employee.name_patronymic_normalized,
       last_name_normalized: employee.last_name_normalized,
       work_position: employee.work_position
     };
   });
+}
+
+/**
+ * Лист «Операторы» — ручной маппинг «как Mango пишет нашу сторону» →
+ * «ФИО сотрудника». Ведёт его пользователь: скрипт лист только читает,
+ * не создаёт и не пишет. Колонки: mango_side, Сотрудник.
+ *
+ * Возвращает { normalizeFio_(mango_side): 'Сотрудник' } — сравнение
+ * нечувствительно к регистру, «ё» и лишним пробелам.
+ * Нет листа или он пуст — пустой маппинг и OPERATORS_SHEET_EMPTY в «Лог»;
+ * скан при этом не падает.
+ */
+function loadOperatorMapping_(push) {
+  if (OPERATOR_MAPPING_CACHE_) return OPERATOR_MAPPING_CACHE_;
+
+  const mapping = {};
+  const sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.OPERATORS_SHEET_NAME);
+
+  if (!sheet || sheet.getLastRow() < 2 || sheet.getLastColumn() < 1) {
+    logEmployeesEvent_(
+      push,
+      'OPERATORS_SHEET_EMPTY',
+      'Лист «' + CONFIG.OPERATORS_SHEET_NAME + '» отсутствует или пуст: ' +
+        'ручной маппинг операторов не применяется.'
+    );
+
+    OPERATOR_MAPPING_CACHE_ = mapping;
+    return OPERATOR_MAPPING_CACHE_;
+  }
+
+  const headerMap = getHeaderMap_(sheet);
+  const keyColumn = headerMap[OPERATORS_KEY_HEADER];
+  const valueColumn = headerMap[OPERATORS_VALUE_HEADER];
+
+  if (!keyColumn || !valueColumn) {
+    logEmployeesEvent_(
+      push,
+      'OPERATORS_SHEET_EMPTY',
+      'На листе «' + CONFIG.OPERATORS_SHEET_NAME + '» нет колонок «' +
+        OPERATORS_KEY_HEADER + '» и «' + OPERATORS_VALUE_HEADER + '».'
+    );
+
+    OPERATOR_MAPPING_CACHE_ = mapping;
+    return OPERATOR_MAPPING_CACHE_;
+  }
+
+  const lastRow = sheet.getLastRow();
+  const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+
+  values.forEach(function(row) {
+    const key = normalizeFio_(row[keyColumn - 1]);
+    const value = String(row[valueColumn - 1] === null || row[valueColumn - 1] === undefined
+      ? ''
+      : row[valueColumn - 1]).trim();
+
+    // Полупустая строка маппингом не является.
+    if (!key || !value) return;
+
+    // Дубликат ключа — работает первая строка, остальные только в лог.
+    if (mapping[key] !== undefined) {
+      logEmployeesEvent_(
+        push,
+        'OPERATORS_SHEET_DUPLICATE',
+        'На листе «' + CONFIG.OPERATORS_SHEET_NAME + '» повторяется mango_side «' + key +
+          '». Используется первое значение: ' + mapping[key] + ', пропущено: ' + value
+      );
+
+      return;
+    }
+
+    mapping[key] = value;
+  });
+
+  if (Object.keys(mapping).length === 0) {
+    logEmployeesEvent_(
+      push,
+      'OPERATORS_SHEET_EMPTY',
+      'Лист «' + CONFIG.OPERATORS_SHEET_NAME + '» не содержит ни одной пары mango_side → Сотрудник.'
+    );
+  }
+
+  OPERATOR_MAPPING_CACHE_ = mapping;
+
+  return OPERATOR_MAPPING_CACHE_;
 }
 
 /**
@@ -1951,7 +2084,8 @@ function parseEmployeeBoolean_(value) {
  *
  * ВНИМАНИЕ: JS-копия этого алгоритма (normalizeFio_ + matchEmployeeByName_)
  * живёт в n8n.json, нода «Prepare Sheet Update» — она матчит
- * requested_specialist. Менять обе реализации нужно синхронно.
+ * requested_specialist и appointment_specialist. Реализации обязаны быть
+ * идентичны: менять их нужно синхронно.
  *
  * Никакого fuzzy-матчинга: неуверенное совпадение — это NOT_FOUND,
  * а не подстановка похожего сотрудника.
@@ -2067,15 +2201,17 @@ function baseFioForm_(normalized) {
  * Сопоставление имени со справочником.
  *
  * Возвращает { status, bitrix_user_id, full_name, comment }, где status —
- * EXACT | SHORT_EXACT | LASTNAME_UNIQUE | NOT_FOUND | AMBIGUOUS | EMPTY.
+ * EXACT | SHORT_EXACT | NAME_PATRONYMIC_UNIQUE | LASTNAME_UNIQUE |
+ * NOT_FOUND | AMBIGUOUS | EMPTY.
  *
  * Порядок правил (первое сработавшее останавливает поиск):
  *   1. пустое имя → EMPTY;
  *   2. полное ФИО → EXACT;
  *   3. короткая форма «Фамилия И О», в т.ч. со слитными инициалами → SHORT_EXACT;
- *   4. одна фамилия → LASTNAME_UNIQUE;
- *   5. падежная форма фамилии, только при единственном кандидате → LASTNAME_UNIQUE;
- *   6. иначе → NOT_FOUND.
+ *   4. «Имя Отчество» → NAME_PATRONYMIC_UNIQUE (имя без отчества не матчится);
+ *   5. одна фамилия → LASTNAME_UNIQUE;
+ *   6. падежная форма фамилии, только при единственном кандидате → LASTNAME_UNIQUE;
+ *   7. иначе → NOT_FOUND.
  *
  * Несколько кандидатов на любом шаге — AMBIGUOUS, автоподстановки нет.
  * options.activeOnly (по умолчанию true) — матчить только active = TRUE.
@@ -2110,6 +2246,10 @@ function matchEmployeeByName_(name, employees, options) {
 
   const shortKey = fioShortKey_(normalized);
 
+  // «Михаил Сергеевич» — минимум два токена. Одно имя («Михаил») никого
+  // не идентифицирует и по имени-отчеству не матчится.
+  const hasPatronymic = normalized.split(' ').filter(Boolean).length >= 2;
+
   const steps = [
     {
       status: 'EXACT',
@@ -2122,6 +2262,15 @@ function matchEmployeeByName_(name, employees, options) {
       test: function(employee) {
         return employee.short_name_normalized === normalized ||
           matchesFioShortForm_(shortKey, employee.short_name_normalized, false);
+      }
+    },
+    {
+      status: 'NAME_PATRONYMIC_UNIQUE',
+      comment: 'совпадение по имени и отчеству',
+      test: function(employee) {
+        return hasPatronymic &&
+          !!employee.name_patronymic_normalized &&
+          employee.name_patronymic_normalized === normalized;
       }
     },
     {
@@ -2139,6 +2288,7 @@ function matchEmployeeByName_(name, employees, options) {
       result.status = steps[i].status;
       result.bitrix_user_id = found[0].bitrix_user_id;
       result.full_name = found[0].full_name;
+      result.comment = steps[i].comment || '';
       return result;
     }
 
@@ -2151,6 +2301,7 @@ function matchEmployeeByName_(name, employees, options) {
 
   // Падежные формы: «Коныховой», «Кузнецову». Статус не поднимается выше
   // LASTNAME_UNIQUE и допускается только при единственном кандидате.
+  // К имени-отчеству падежный шаг не применяется.
   const base = baseFioForm_(normalized);
   const baseKey = fioShortKey_(base);
 
@@ -2185,7 +2336,8 @@ function matchEmployeeByName_(name, employees, options) {
  * Автоподстановка ФИО разрешена только при этих статусах.
  */
 function isConfidentEmployeeMatch_(status) {
-  return ['EXACT', 'SHORT_EXACT', 'LASTNAME_UNIQUE'].indexOf(String(status || '')) !== -1;
+  return ['EXACT', 'SHORT_EXACT', 'NAME_PATRONYMIC_UNIQUE', 'LASTNAME_UNIQUE']
+    .indexOf(String(status || '')) !== -1;
 }
 
 /**

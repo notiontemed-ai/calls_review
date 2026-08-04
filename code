@@ -24,6 +24,7 @@ const CONFIG = {
 
   SHEET_NAME: 'Записи звонков',
   LOG_SHEET_NAME: 'Лог',
+  PROMPTS_SHEET_NAME: 'Промпты',
 
   MAX_FILES_PER_RUN: 500,
   MAX_SEND_PER_RUN: 50,
@@ -61,31 +62,55 @@ const HEADERS = [
   'created_at',
   'updated_at',
 
-  // Колонки транскрибации
+  // Колонки транскрибации, которые заполняет сам скрипт
   'call_initiator',
   'transcription_send_status',
   'transcription_sent_at',
+
+  // Колонки результата (их заполняет n8n) — см. RESULT_HEADERS
   'transcription_received_at',
   'transcription_error',
-  'raw_transcript',
-  'dialogue_text',
-  'main_intent',
-  'additional_intents',
-  'intent_description',
-  'call_result',
+  'transcript_text',
+  'transcript_left',
+  'transcript_right',
+  'summary',
+  'overall_score',
+  'problem_level',
+  'is_problem_call',
+  'main_strength',
+  'main_error',
+  'recommended_feedback',
+  'rule_results_json',
+  'prompt_version',
   'transcription_n8n_execution_id'
 ];
 
-// Колонки, которые заполняет n8n. Их буквы передаются в payload.
+/**
+ * Колонки, которые заполняет n8n. Их буквы передаются в payload
+ * (result_columns) и в этом же порядке используются нодой
+ * «Prepare Sheet Update» в n8n.json — список общий для скрипта и
+ * workflow, менять его надо одновременно в обоих местах.
+ *
+ * Колонки старого контракта (raw_transcript, dialogue_text, main_intent,
+ * additional_intents, intent_description, call_result) намеренно
+ * исключены: workflow v2 их не заполняет. С существующего листа они
+ * не удаляются — ensureSheetHeaders_ только дописывает недостающие.
+ */
 const RESULT_HEADERS = [
   'transcription_received_at',
   'transcription_error',
-  'raw_transcript',
-  'dialogue_text',
-  'main_intent',
-  'additional_intents',
-  'intent_description',
-  'call_result',
+  'transcript_text',
+  'transcript_left',
+  'transcript_right',
+  'summary',
+  'overall_score',
+  'problem_level',
+  'is_problem_call',
+  'main_strength',
+  'main_error',
+  'recommended_feedback',
+  'rule_results_json',
+  'prompt_version',
   'transcription_n8n_execution_id'
 ];
 
@@ -99,6 +124,90 @@ const SIP_LINE_NAMES = {
 };
 
 const LOG_HEADERS = ['timestamp', 'run_id', 'step', 'file', 'details'];
+
+/************************************************************
+ * ЛИСТ «Промпты»
+ *
+ * Структура листа:
+ *   A1:C1  — шапка блока параметров
+ *   A2:B4  — параметры: prompt_version, transcription_prompt,
+ *            analysis_system_prompt (может быть пустым)
+ *   строка с «rule_id» в колонке A — шапка таблицы правил
+ *   ниже   — сами правила
+ *
+ * Позиции строк не зашиты: параметры ищутся по имени в колонке A,
+ * таблица правил — по строке, где в колонке A стоит «rule_id».
+ ************************************************************/
+
+const PROMPT_PARAM_KEYS = [
+  'prompt_version',
+  'transcription_prompt',
+  'analysis_system_prompt'
+];
+
+const PROMPT_RULE_HEADERS = ['rule_id', 'title', 'description', 'weight', 'na_allowed'];
+
+const PROMPTS_SHEET_HEADER = ['Параметр', 'Значение', 'Комментарий'];
+
+const DEFAULT_PROMPTS_PARAMS = [
+  [
+    'prompt_version',
+    'v2',
+    'Версия набора промптов. Записывается в колонку prompt_version.'
+  ],
+  [
+    'transcription_prompt',
+    'Транскрибируй телефонный разговор на русском языке дословно, ' +
+      'сохраняя разговорную речь. Не пересказывай и не сокращай.',
+    'Обязательное поле. Пустое значение — ошибка ещё до отправки в n8n.'
+  ],
+  [
+    'analysis_system_prompt',
+    '',
+    'Необязательное поле. Пусто — используется системный промпт по умолчанию из ноды n8n.'
+  ]
+];
+
+const DEFAULT_PROMPTS_RULES = [
+  [
+    'greeting',
+    'Приветствие',
+    'Оператор поздоровался, представился и назвал клинику.',
+    1,
+    'FALSE'
+  ],
+  [
+    'needs',
+    'Выявление потребности',
+    'Оператор выяснил причину обращения и задал уточняющие вопросы.',
+    2,
+    'FALSE'
+  ],
+  [
+    'objections',
+    'Работа с возражениями',
+    'Оператор отработал сомнения клиента без давления и спора.',
+    2,
+    'TRUE'
+  ],
+  [
+    'next_step',
+    'Следующий шаг',
+    'Оператор предложил конкретный следующий шаг: запись, звонок, отправку информации.',
+    2,
+    'FALSE'
+  ],
+  [
+    'politeness',
+    'Вежливость и тон',
+    'Оператор говорил вежливо, не перебивал, сохранял доброжелательный тон.',
+    1,
+    'FALSE'
+  ]
+];
+
+// Кэш на время одного выполнения скрипта: лист читается один раз.
+let PROMPTS_CACHE_ = null;
 
 /************************************************************
  * MENU
@@ -385,6 +494,30 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
 
     getWebhookUrl_();
 
+    // Промпты читаются и валидируются ДО отправки: при пустом или
+    // неверно заполненном листе «Промпты» в n8n не уходит ни одного запроса.
+    let prompts;
+
+    try {
+      prompts = loadPrompts_();
+    } catch (e) {
+      const promptsError = String((e && e.message) || e);
+
+      push('PROMPTS_ERROR', '', promptsError);
+      push('FINISH', '', 'Отправка отменена: ' + promptsError);
+      SpreadsheetApp.getActive().toast('Отправка отменена: проверьте лист «' + CONFIG.PROMPTS_SHEET_NAME + '».');
+      showAlert_('Отправка в n8n', promptsError);
+      return;
+    }
+
+    push(
+      'PROMPTS',
+      '',
+      'Промпты загружены с листа «' + CONFIG.PROMPTS_SHEET_NAME + '»: версия «' +
+        (prompts.prompt_version || '(не задана)') + '», правил: ' + prompts.evaluation_rules.length +
+        ', analysis_system_prompt: ' + (prompts.analysis_system_prompt ? 'задан' : 'по умолчанию из n8n')
+    );
+
     const sheet = getOrCreateSheet_();
     ensureHeaders_(sheet);
 
@@ -537,8 +670,12 @@ function sendTranscriptionRow_(sheet, rowNumber, row, headerMap, push) {
     resultColumns[header] = columnToLetter_(column);
   });
 
+  // Промпты уже провалидированы (loadPrompts_ вызывается до цикла отправки)
+  // и закэшированы, поэтому лист «Промпты» читается один раз за запуск.
+  const prompts = loadPrompts_();
+
   const payload = {
-    action: 'transcribe_call',
+    action: 'transcribe_and_analyze_call',
 
     // ID берётся из самой таблицы — руками нигде не указывается.
     spreadsheet_id: SpreadsheetApp.getActive().getId(),
@@ -562,7 +699,10 @@ function sendTranscriptionRow_(sheet, rowNumber, row, headerMap, push) {
     operator_name: getCellByHeader_(row, headerMap, 'operator_name'),
 
     drive_file_id: getCellByHeader_(row, headerMap, 'drive_file_id'),
-    drive_url: getCellByHeader_(row, headerMap, 'drive_url')
+    drive_url: getCellByHeader_(row, headerMap, 'drive_url'),
+
+    // Результат n8n пишет в таблицу сам, поэтому callback не передаётся.
+    prompts: prompts
   };
 
   const missing =
@@ -774,6 +914,8 @@ function httpStatusHint_(statusCode, url) {
  */
 const FLUSH_LOG_STEPS = [
   'START',
+  'PROMPTS',
+  'PROMPTS_ERROR',
   'CANDIDATES',
   'NO_CANDIDATES',
   'ROW_SEND',
@@ -1005,6 +1147,253 @@ function flushLog_(rows) {
 }
 
 /************************************************************
+ * ПРОМПТЫ (ЛИСТ «Промпты»)
+ *
+ * loadPrompts_() возвращает объект, который целиком уходит в payload
+ * в поле prompts:
+ *   {
+ *     prompt_version: 'v2',
+ *     transcription_prompt: '...',
+ *     analysis_system_prompt: '...',   // ключа нет, если поле пустое
+ *     evaluation_rules: [
+ *       { rule_id, title, description, weight, na_allowed }
+ *     ]
+ *   }
+ *
+ * Любая проблема с листом — исключение с понятным текстом. Оно ловится
+ * в отправке и попадает на лист «Лог» ДО того, как что-то уйдёт в n8n.
+ ************************************************************/
+
+function loadPrompts_() {
+  if (PROMPTS_CACHE_) return PROMPTS_CACHE_;
+
+  const sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.PROMPTS_SHEET_NAME);
+
+  if (!sheet) {
+    createDefaultPromptsSheet_();
+
+    throw new Error(
+      'Лист «' + CONFIG.PROMPTS_SHEET_NAME + '» не найден — он создан с примером содержимого. ' +
+      'Заполните лист «' + CONFIG.PROMPTS_SHEET_NAME + '» (промпт транскрибации и правила оценки) ' +
+      'и повторите отправку.'
+    );
+  }
+
+  const parsed = parsePromptsSheet_(sheet);
+  const problems = validatePrompts_(parsed);
+
+  if (problems.length > 0) {
+    throw new Error(
+      'Лист «' + CONFIG.PROMPTS_SHEET_NAME + '» заполнен неверно: ' + problems.join('; ') + '.'
+    );
+  }
+
+  const prompts = {
+    prompt_version: parsed.params.prompt_version,
+    transcription_prompt: parsed.params.transcription_prompt,
+    evaluation_rules: parsed.rules
+  };
+
+  // Пустой analysis_system_prompt не передаём: нода n8n подставит дефолт.
+  if (parsed.params.analysis_system_prompt) {
+    prompts.analysis_system_prompt = parsed.params.analysis_system_prompt;
+  }
+
+  PROMPTS_CACHE_ = prompts;
+
+  return prompts;
+}
+
+/**
+ * Читает лист целиком и раскладывает на параметры и правила.
+ * Ничего не валидирует — это делает validatePrompts_.
+ */
+function parsePromptsSheet_(sheet) {
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+
+  const result = {
+    params: { prompt_version: '', transcription_prompt: '', analysis_system_prompt: '' },
+    rules: [],
+    rulesHeaderRow: 0,
+    ruleRowNumbers: []
+  };
+
+  if (lastRow < 1 || lastColumn < 1) return result;
+
+  const values = sheet.getRange(1, 1, lastRow, Math.max(lastColumn, PROMPT_RULE_HEADERS.length)).getValues();
+
+  let rulesHeaderIndex = -1;
+
+  for (let i = 0; i < values.length; i++) {
+    if (String(values[i][0] || '').trim().toLowerCase() === 'rule_id') {
+      rulesHeaderIndex = i;
+      break;
+    }
+  }
+
+  const paramsLastIndex = rulesHeaderIndex === -1 ? values.length : rulesHeaderIndex;
+
+  for (let i = 0; i < paramsLastIndex; i++) {
+    const key = String(values[i][0] || '').trim();
+
+    if (PROMPT_PARAM_KEYS.indexOf(key) !== -1) {
+      result.params[key] = String(values[i][1] === null || values[i][1] === undefined ? '' : values[i][1]).trim();
+    }
+  }
+
+  if (rulesHeaderIndex === -1) return result;
+
+  result.rulesHeaderRow = rulesHeaderIndex + 1;
+
+  for (let i = rulesHeaderIndex + 1; i < values.length; i++) {
+    const row = values[i];
+
+    const ruleId = String(row[0] === null || row[0] === undefined ? '' : row[0]).trim();
+    const title = String(row[1] === null || row[1] === undefined ? '' : row[1]).trim();
+    const description = String(row[2] === null || row[2] === undefined ? '' : row[2]).trim();
+    const weightRaw = row[3];
+    const naRaw = row[4];
+
+    // Полностью пустая строка — просто разделитель, не ошибка.
+    if (!ruleId && !title && !description &&
+        (weightRaw === '' || weightRaw === null || weightRaw === undefined) &&
+        (naRaw === '' || naRaw === null || naRaw === undefined)) {
+      continue;
+    }
+
+    result.rules.push({
+      rule_id: ruleId,
+      title: title,
+      description: description,
+      weight: parsePromptWeight_(weightRaw),
+      na_allowed: parsePromptBoolean_(naRaw)
+    });
+
+    result.ruleRowNumbers.push(i + 1);
+  }
+
+  return result;
+}
+
+/**
+ * Список проблем листа. Пустой массив — лист валиден.
+ */
+function validatePrompts_(parsed) {
+  const problems = [];
+
+  if (!parsed.params.transcription_prompt) {
+    problems.push('не заполнен transcription_prompt');
+  }
+
+  if (!parsed.rulesHeaderRow) {
+    problems.push('не найдена таблица правил (строка с «rule_id» в первой колонке)');
+  }
+
+  if (parsed.rules.length === 0) {
+    problems.push('нет ни одного правила оценки (нужно минимум одно)');
+    return problems;
+  }
+
+  const seen = {};
+
+  parsed.rules.forEach(function(rule, index) {
+    const rowNumber = parsed.ruleRowNumbers[index];
+    const where = 'строка ' + rowNumber;
+
+    if (!rule.rule_id) {
+      problems.push(where + ': пустой rule_id');
+    } else if (seen[rule.rule_id]) {
+      problems.push(where + ': повторяющийся rule_id «' + rule.rule_id + '»');
+    } else {
+      seen[rule.rule_id] = true;
+    }
+
+    if (!rule.title) {
+      problems.push(where + ': пустой title');
+    }
+
+    if (rule.weight === null) {
+      problems.push(where + ': weight должен быть положительным числом');
+    }
+
+    if (rule.na_allowed === null) {
+      problems.push(where + ': na_allowed должен быть TRUE или FALSE');
+    }
+  });
+
+  return problems;
+}
+
+/**
+ * Вес правила: положительное число. Всё остальное — null (ошибка).
+ */
+function parsePromptWeight_(value) {
+  if (value === null || value === undefined || value === '') return null;
+
+  const n = Number(String(value).replace(',', '.').trim());
+
+  if (!isFinite(n) || n <= 0) return null;
+
+  return n;
+}
+
+/**
+ * na_allowed: чекбокс, TRUE/FALSE, ДА/НЕТ, 1/0. Всё остальное — null (ошибка).
+ */
+function parsePromptBoolean_(value) {
+  if (value === true) return true;
+  if (value === false) return false;
+
+  const s = String(value === null || value === undefined ? '' : value).trim().toLowerCase();
+
+  if (['true', 'да', 'yes', '1', 'истина'].indexOf(s) !== -1) return true;
+  if (['false', 'нет', 'no', '0', 'ложь'].indexOf(s) !== -1) return false;
+
+  return null;
+}
+
+/**
+ * Создаёт лист «Промпты» с рабочим примером: версия, промпт
+ * транскрибации и пять правил оценки. Существующий лист не трогает.
+ */
+function createDefaultPromptsSheet_() {
+  const ss = SpreadsheetApp.getActive();
+
+  if (ss.getSheetByName(CONFIG.PROMPTS_SHEET_NAME)) {
+    return ss.getSheetByName(CONFIG.PROMPTS_SHEET_NAME);
+  }
+
+  const sheet = ss.insertSheet(CONFIG.PROMPTS_SHEET_NAME);
+
+  const rows = [];
+
+  rows.push(PROMPTS_SHEET_HEADER.concat(['', '']));
+
+  DEFAULT_PROMPTS_PARAMS.forEach(function(param) {
+    rows.push([param[0], param[1], param[2], '', '']);
+  });
+
+  rows.push(['', '', '', '', '']);
+  rows.push(PROMPT_RULE_HEADERS.slice());
+
+  DEFAULT_PROMPTS_RULES.forEach(function(rule) {
+    rows.push(rule.slice());
+  });
+
+  sheet.getRange(1, 1, rows.length, PROMPT_RULE_HEADERS.length).setValues(rows);
+
+  sheet.getRange(1, 1, 1, PROMPTS_SHEET_HEADER.length).setFontWeight('bold');
+  sheet.getRange(DEFAULT_PROMPTS_PARAMS.length + 3, 1, 1, PROMPT_RULE_HEADERS.length).setFontWeight('bold');
+
+  sheet.setColumnWidth(1, 200);
+  sheet.setColumnWidth(2, 420);
+  sheet.setColumnWidth(3, 420);
+
+  return sheet;
+}
+
+/************************************************************
  * CALL KEY
  ************************************************************/
 
@@ -1192,39 +1581,69 @@ function ensureHeaders_(sheet) {
   ensureSheetHeaders_(sheet, HEADERS);
 }
 
+/**
+ * Дописывает недостающие заголовки, ничего не удаляя и не сдвигая.
+ * Новые колонки добавляются ПОСЛЕ последней непустой ячейки шапки —
+ * по её фактической позиции, а не по количеству заголовков: колонки,
+ * которых больше нет в HEADERS (старый контракт v1), остаются на месте
+ * вместе со своими данными.
+ */
 function ensureSheetHeaders_(sheet, headers) {
   const lastRow = sheet.getLastRow();
   const lastColumn = sheet.getLastColumn();
 
   if (lastRow === 0 || lastColumn === 0) {
+    ensureSheetColumnCount_(sheet, headers.length);
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
     sheet.setFrozenRows(1);
     return;
   }
 
   const firstRow = sheet
-    .getRange(1, 1, 1, Math.max(lastColumn, headers.length))
+    .getRange(1, 1, 1, lastColumn)
     .getValues()[0]
     .map(String)
     .map(s => s.trim());
 
-  const existingHeaders = firstRow.filter(Boolean);
+  const existing = {};
+  let lastHeaderColumn = 0;
 
-  if (existingHeaders.length === 0) {
+  firstRow.forEach(function(header, index) {
+    if (!header) return;
+
+    lastHeaderColumn = index + 1;
+    if (existing[header] === undefined) existing[header] = index + 1;
+  });
+
+  if (lastHeaderColumn === 0) {
+    ensureSheetColumnCount_(sheet, headers.length);
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
     sheet.setFrozenRows(1);
     return;
   }
 
-  const missing = headers.filter(h => existingHeaders.indexOf(h) === -1);
+  const missing = headers.filter(h => existing[h] === undefined);
 
   if (missing.length > 0) {
+    ensureSheetColumnCount_(sheet, lastHeaderColumn + missing.length);
+
     sheet
-      .getRange(1, existingHeaders.length + 1, 1, missing.length)
+      .getRange(1, lastHeaderColumn + 1, 1, missing.length)
       .setValues([missing]);
   }
 
   sheet.setFrozenRows(1);
+}
+
+/**
+ * Расширяет лист вправо, если колонок физически меньше, чем нужно.
+ */
+function ensureSheetColumnCount_(sheet, needed) {
+  const maxColumns = sheet.getMaxColumns();
+
+  if (maxColumns < needed) {
+    sheet.insertColumnsAfter(maxColumns, needed - maxColumns);
+  }
 }
 
 function getHeaderMap_(sheet) {

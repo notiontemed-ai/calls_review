@@ -35,6 +35,11 @@ const CONFIG = {
   MAX_SEND_PER_RUN: 50,
   MAX_LOG_ROWS: 20000,
 
+  // Записи меньше этого размера — несостоявшиеся разговоры (сброс, обрыв).
+  // Их не отправляем в n8n: ни транскрибации, ни анализа по ним нет.
+  // Порог задаётся ТОЛЬКО здесь: и текст пометки, и лог берут его отсюда.
+  MIN_AUDIO_FILE_SIZE_BYTES: 150 * 1024,
+
   RENAME_FILES_ON_DRIVE: true,
 
   N8N_WEBHOOK_URL: 'https://n8n-x3.tech.temed.ru/webhook/mango-call-transcribe-stereo-safe-v2',
@@ -174,6 +179,37 @@ const SIP_LINE_NAMES = {
   '74993223022': ''
   // '79310093200': 'Roistat Сайт СПб'  ← пример: впишите свои названия
 };
+
+/**
+ * Принудительный числовой формат колонок листа «Записи звонков».
+ *
+ * Google Sheets наследует формат соседних ячеек, поэтому колонка
+ * call_duration_seconds однажды получила формат даты и число 25
+ * показывалось как «1900-01-24 0:00:00». Формат восстанавливается при
+ * каждом обеспечении заголовков — см. ensureDurationColumnFormats_.
+ *
+ *   call_duration_seconds → '0' (целое число)
+ *   call_duration        → '@' (текст, иначе «2:20» распознаётся как время)
+ */
+const DURATION_COLUMN_FORMATS = {
+  call_duration_seconds: '0',
+  call_duration: '@'
+};
+
+/**
+ * Эпоха серийных чисел Google Sheets: 1899-12-30.
+ * Серийное число даты и есть исходное число, поэтому испорченное
+ * форматом значение секунд восстанавливается как «дата минус эпоха».
+ */
+const SHEET_SERIAL_EPOCH_UTC_MS = Date.UTC(1899, 11, 30);
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * Статус строк, которые сознательно не отправляются в n8n.
+ * Все статусы, начинающиеся со SKIPPED, отсекаются в getSendSkipCode_.
+ */
+const SKIPPED_SHORT_STATUS = 'SKIPPED_SHORT';
 
 const LOG_HEADERS = ['timestamp', 'run_id', 'step', 'file', 'details'];
 
@@ -351,6 +387,7 @@ function scanMangoRecordingsFolder() {
     let skippedDuplicates = 0;
     let renamed = 0;
     let skippedNotMp3 = 0;
+    let skippedShort = 0;
     let errors = 0;
 
     const rowsToAppend = [];
@@ -373,11 +410,12 @@ function scanMangoRecordingsFolder() {
 
         try {
           const filenameRaw = file.getName();
+          const fileSize = file.getSize();
 
           push(
             'FILE',
             filenameRaw,
-            'MIME: ' + file.getMimeType() + ', размер: ' + file.getSize() + ' байт'
+            'MIME: ' + file.getMimeType() + ', размер: ' + fileSize + ' байт'
           );
 
           if (!isMp3_(filenameRaw)) {
@@ -451,6 +489,21 @@ function scanMangoRecordingsFolder() {
             describeOperatorResolution_(parsed.mango_side, operator)
           );
 
+          // Короткая запись — несостоявшийся разговор. Строка создаётся
+          // полностью, но сразу помечается: в n8n она не уйдёт ни сейчас,
+          // ни при последующих запусках отправки.
+          const isShort = isShortAudioSize_(fileSize);
+
+          if (isShort) {
+            skippedShort++;
+
+            push(
+              'ROW_SKIPPED_SHORT',
+              filenameFixed,
+              describeShortRecording_(fileSize)
+            );
+          }
+
           const rowObj = {
             call_key: callKey,
             filename_raw: filenameRaw,
@@ -474,6 +527,11 @@ function scanMangoRecordingsFolder() {
             created_at: now,
             updated_at: now
           };
+
+          if (isShort) {
+            rowObj.transcription_send_status = SKIPPED_SHORT_STATUS;
+            rowObj.summary = shortRecordingSummary_();
+          }
 
           rowsToAppend.push(makeRowByHeaders_(rowObj, headerMap, sheet.getLastColumn()));
           existingCallKeys.add(callKey);
@@ -507,6 +565,7 @@ function scanMangoRecordingsFolder() {
       ', дублей: ' + skippedDuplicates +
       ', переименовано: ' + renamed +
       ', не mp3: ' + skippedNotMp3 +
+      ', коротких (' + shortRecordingThresholdText_() + '): ' + skippedShort +
       ', ошибок: ' + errors;
 
     push('FINISH', '', message);
@@ -652,6 +711,12 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
     // Причины пропуска только считаются: построчный ROW_SKIP при сотнях
     // уже отправленных строк засорял «Лог» и растягивал запуск на минуты.
     const selection = collectSendCandidates_(values, headerMap, sendLimit);
+
+    // ФАЗА 1.5 — проверка размера файла: она первая среди проверок отправки
+    // и покрывает строки, просканированные до появления порога. Один
+    // getSize на кандидата: кандидатов не больше лимита запуска.
+    skipShortRecordingCandidates_(sheet, headerMap, selection, push);
+
     const skipSummary = describeSkipCounters_(selection);
 
     if (selection.candidates.length === 0) {
@@ -688,12 +753,22 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
       const row = candidate.row;
       const callKey = getCellByHeader_(row, headerMap, 'call_key');
 
-      // Строки со статусом ERROR НЕ пропускаются — повторяем отправку,
-      // старая ошибка в transcription_error затирается при успехе.
-      const transcriptionError = getCellByHeader_(row, headerMap, 'transcription_error');
+      // Повтор после ошибки n8n (например «timeout exceeded»): строка снова
+      // стала кандидатом, потому что результата у неё нет. Поля прошлой
+      // попытки чистим ДО отправки — иначе строка выглядит одновременно
+      // и отправленной, и завершившейся ошибкой.
+      if (candidate.isRetry) {
+        const previousError = getCellByHeader_(row, headerMap, 'transcription_error');
 
-      if (transcriptionError) {
-        push('ROW_RETRY', callKey, 'Строка ' + rowNumber + ': повтор после ошибки: ' + transcriptionError.slice(0, 200));
+        push(
+          'ROW_RETRY',
+          callKey,
+          'Строка ' + rowNumber + ': повтор после ошибки: ' + previousError.slice(0, 200) +
+            '. Очищены transcription_error и transcription_received_at.'
+        );
+
+        setCellByHeader_(sheet, rowNumber, headerMap, 'transcription_error', '');
+        setCellByHeader_(sheet, rowNumber, headerMap, 'transcription_received_at', '');
       }
 
       try {
@@ -1046,8 +1121,8 @@ const FLUSH_LOG_STEPS = [
 
 /**
  * Код причины пропуска строки при отправке ('' — строка-кандидат).
- * Ровно те же условия, что и раньше в цикле отправки, — вынесены в
- * функцию, чтобы отбор кандидатов и сама отправка не могли разойтись.
+ * Условия одни на отбор кандидатов и на саму отправку: разойтись они
+ * не могут, потому что живут в одной функции.
  */
 function getSendSkipCode_(row, headerMap) {
   const driveFileId = getCellByHeader_(row, headerMap, 'drive_file_id');
@@ -1057,11 +1132,37 @@ function getSendSkipCode_(row, headerMap) {
 
   if (!driveFileId) return 'NO_DRIVE_FILE_ID';
   if (parseError) return 'ERROR_TEXT';
+
+  // Сознательно пропущенные строки (SKIPPED_SHORT и любые будущие
+  // SKIPPED_*) в n8n не уходят никогда.
+  if (sendStatus.indexOf('SKIPPED') === 0) return 'SKIPPED';
+
+  // Автоповтор: строка с ошибкой n8n и без транскрипта снова кандидат —
+  // проверяется ДО SENT и HAS_RESULT, иначе `timeout exceeded` навсегда
+  // выводил бы строку из отправки.
+  if (isSendRetryRow_(row, headerMap)) return '';
+
+  // Есть результат — не переотправляем, даже если transcription_error
+  // почему-то непустой.
+  if (getCellByHeader_(row, headerMap, 'transcript_text')) return 'HAS_RESULT';
+
   if (sendStatus === 'SENT') return 'SENT';
   if (receivedAt) return 'HAS_RESULT';
 
   // Строки со статусом ERROR НЕ пропускаются — повторяем отправку.
   return '';
+}
+
+/**
+ * Строка-повтор: n8n вернул ошибку (или ошибку записала сама отправка),
+ * а транскрипта так и нет. Ограничения числа попыток нет — вечно падающая
+ * строка видна в «Логе» по повторяющейся ошибке.
+ */
+function isSendRetryRow_(row, headerMap) {
+  const transcriptionError = getCellByHeader_(row, headerMap, 'transcription_error');
+  const transcriptText = getCellByHeader_(row, headerMap, 'transcript_text');
+
+  return !!transcriptionError && !transcriptText;
 }
 
 /**
@@ -1079,7 +1180,10 @@ function collectSendCandidates_(values, headerMap, sendLimit) {
       SENT: 0,
       NO_DRIVE_FILE_ID: 0,
       ERROR_TEXT: 0,
-      HAS_RESULT: 0
+      HAS_RESULT: 0,
+      SKIPPED: 0,
+      // Заполняется фазой 1.5: строки, помеченные SKIPPED_SHORT в этом запуске.
+      SKIPPED_SHORT: 0
     }
   };
 
@@ -1096,7 +1200,11 @@ function collectSendCandidates_(values, headerMap, sendLimit) {
       continue;
     }
 
-    selection.candidates.push({ rowNumber: i + 2, row: row });
+    selection.candidates.push({
+      rowNumber: i + 2,
+      row: row,
+      isRetry: isSendRetryRow_(row, headerMap)
+    });
 
     if (sendLimit !== null && selection.candidates.length >= sendLimit) break;
   }
@@ -1105,15 +1213,120 @@ function collectSendCandidates_(values, headerMap, sendLimit) {
 }
 
 /**
- * Счётчики причин пропуска одной строкой для лога.
+ * Счётчики причин пропуска одной строкой для лога. RETRY — не причина
+ * пропуска, а разбивка самих кандидатов: сколько из них повторы после
+ * ошибки n8n.
  */
 function describeSkipCounters_(selection) {
   const skipped = selection.skipped;
 
+  const retry = selection.candidates.filter(function(candidate) {
+    return candidate.isRetry;
+  }).length;
+
   return 'SENT=' + skipped.SENT +
     ', нет drive_file_id=' + skipped.NO_DRIVE_FILE_ID +
     ', error_text=' + skipped.ERROR_TEXT +
-    ', есть результат=' + skipped.HAS_RESULT;
+    ', есть результат=' + skipped.HAS_RESULT +
+    ', SKIPPED=' + skipped.SKIPPED +
+    ', SKIPPED_SHORT=' + skipped.SKIPPED_SHORT +
+    ', RETRY=' + retry;
+}
+
+/************************************************************
+ * КОРОТКИЕ ЗАПИСИ (МЕНЬШЕ ПОРОГА)
+ *
+ * Файл меньше CONFIG.MIN_AUDIO_FILE_SIZE_BYTES — несостоявшийся разговор
+ * (сброс, обрыв). Такие записи не идут ни в транскрибацию, ни в анализ:
+ * строка помечается сразу — при скане (новые файлы) или перед отправкой
+ * (строки, просканированные до появления порога).
+ ************************************************************/
+
+function isShortAudioSize_(sizeBytes) {
+  // Только настоящее число: неизвестный размер ('' , null) — это не
+  // «короткая запись», такую строку помечать нельзя.
+  if (typeof sizeBytes !== 'number' || !Number.isFinite(sizeBytes)) return false;
+
+  return sizeBytes < Number(CONFIG.MIN_AUDIO_FILE_SIZE_BYTES);
+}
+
+/**
+ * Порог человекочитаемо — из CONFIG, не строкой в тексте.
+ */
+function shortRecordingThresholdText_() {
+  const bytes = Number(CONFIG.MIN_AUDIO_FILE_SIZE_BYTES) || 0;
+
+  return Math.round(bytes / 1024) + ' КБ';
+}
+
+function shortRecordingSummary_() {
+  return 'Разговор не состоялся (файл меньше ' + shortRecordingThresholdText_() + ')';
+}
+
+function describeShortRecording_(sizeBytes) {
+  return 'Короткая запись: ' + sizeBytes + ' байт < порога ' +
+    CONFIG.MIN_AUDIO_FILE_SIZE_BYTES + ' байт (' + shortRecordingThresholdText_() +
+    '). В n8n не отправляется, статус ' + SKIPPED_SHORT_STATUS + '.';
+}
+
+function markRowSkippedShort_(sheet, rowNumber, headerMap) {
+  setCellByHeader_(sheet, rowNumber, headerMap, 'transcription_send_status', SKIPPED_SHORT_STATUS);
+  setCellByHeader_(sheet, rowNumber, headerMap, 'summary', shortRecordingSummary_());
+  setCellByHeader_(sheet, rowNumber, headerMap, 'updated_at', nowString_());
+}
+
+/**
+ * Фаза 1.5 отправки: у каждого кандидата проверяется размер файла на Drive.
+ * Меньше порога — строка помечается SKIPPED_SHORT и выбывает из отправки.
+ *
+ * Недоступный файл (удалён из Drive, нет прав) SKIPPED_SHORT НЕ получает:
+ * такая строка идёт в отправку, и ошибка обрабатывается как раньше.
+ *
+ * selection изменяется на месте: candidates и счётчики.
+ */
+function skipShortRecordingCandidates_(sheet, headerMap, selection, push) {
+  const log = typeof push === 'function' ? push : function() {};
+  const kept = [];
+
+  selection.candidates.forEach(function(candidate) {
+    const row = candidate.row;
+    const rowNumber = candidate.rowNumber;
+    const callKey = getCellByHeader_(row, headerMap, 'call_key');
+    const filename = getCellByHeader_(row, headerMap, 'filename_fixed') || callKey;
+    const driveFileId = getCellByHeader_(row, headerMap, 'drive_file_id');
+
+    let size;
+
+    try {
+      size = DriveApp.getFileById(driveFileId).getSize();
+    } catch (e) {
+      log(
+        'ROW_SIZE_UNKNOWN',
+        filename,
+        'Строка ' + rowNumber + ': не удалось получить размер файла ' + driveFileId +
+          ' — ' + String((e && e.message) || e) + '. Строка отправляется как обычно.'
+      );
+
+      kept.push(candidate);
+      return;
+    }
+
+    if (!isShortAudioSize_(size)) {
+      kept.push(candidate);
+      return;
+    }
+
+    markRowSkippedShort_(sheet, rowNumber, headerMap);
+
+    selection.skippedTotal++;
+    selection.skipped.SKIPPED_SHORT++;
+
+    log('ROW_SKIPPED_SHORT', filename, 'Строка ' + rowNumber + ': ' + describeShortRecording_(size));
+  });
+
+  selection.candidates = kept;
+
+  return selection;
 }
 
 /**
@@ -2834,6 +3047,168 @@ function getOrCreateSheet_() {
 
 function ensureHeaders_(sheet) {
   ensureSheetHeaders_(sheet, HEADERS);
+  ensureDurationColumnFormats_(sheet);
+}
+
+/**
+ * Принудительный формат колонок длительности + разовая починка значений,
+ * уже испорченных форматом даты.
+ *
+ * Идемпотентно и выполняется при каждом обеспечении заголовков: если
+ * формат колонки снова собьётся (копирование, ручная правка), следующий
+ * запуск скана или отправки его восстановит.
+ */
+function ensureDurationColumnFormats_(sheet) {
+  const headerMap = getHeaderMap_(sheet);
+  const maxRows = sheet.getMaxRows();
+
+  if (maxRows < 2) return;
+
+  Object.keys(DURATION_COLUMN_FORMATS).forEach(function(header) {
+    const column = headerMap[header];
+
+    if (!column) return;
+
+    // Весь столбец без строки заголовка: формат держится и на пустых
+    // строках, поэтому новые записи его наследуют.
+    sheet
+      .getRange(2, column, maxRows - 1, 1)
+      .setNumberFormat(DURATION_COLUMN_FORMATS[header]);
+  });
+
+  repairDurationValues_(sheet, headerMap);
+}
+
+/**
+ * Разовая починка значений, испорченных форматом даты.
+ *
+ * call_duration_seconds: если в ячейке число, достаточно setNumberFormat
+ * выше — оно сразу отображается числом. Если запись через API превратила
+ * его в дату-объект, исходное число возвращается из серийного числа даты
+ * (дни от 1899-12-30) — оно и есть записанные секунды.
+ *
+ * call_duration: дату-объект восстанавливаем НЕ из её серийного числа —
+ * «2:20» Sheets мог разобрать и как 2 ч 20 мин, и как 2 мин 20 сек. Текст
+ * пересобирается из call_duration_seconds той же строки: это единственное
+ * значение, которому можно верить. Нет секунд — ячейку не трогаем.
+ *
+ * Возвращает количество починенных ячеек.
+ */
+function repairDurationValues_(sheet, headerMap) {
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) return 0;
+
+  const height = lastRow - 1;
+  const timeZone = sheet.getParent().getSpreadsheetTimeZone();
+  const secondsColumn = headerMap.call_duration_seconds;
+  const durationColumn = headerMap.call_duration;
+
+  const secondsValues = secondsColumn
+    ? sheet.getRange(2, secondsColumn, height, 1).getValues()
+    : null;
+
+  const fixedSecondsRows = [];
+
+  if (secondsValues) {
+    secondsValues.forEach(function(row, index) {
+      if (!isDateValue_(row[0])) return;
+
+      const seconds = sheetSerialSeconds_(row[0], timeZone);
+
+      if (seconds === null) return;
+
+      secondsValues[index][0] = seconds;
+      fixedSecondsRows.push(index + 2);
+    });
+  }
+
+  const durationValues = durationColumn
+    ? sheet.getRange(2, durationColumn, height, 1).getValues()
+    : null;
+
+  const fixedDurationRows = [];
+
+  if (durationValues) {
+    durationValues.forEach(function(row, index) {
+      if (!isDateValue_(row[0])) return;
+
+      const seconds = secondsValues ? Number(secondsValues[index][0]) : NaN;
+
+      if (!Number.isFinite(seconds) || seconds <= 0) return;
+
+      durationValues[index][0] = formatCallDuration_(seconds);
+      fixedDurationRows.push(index + 2);
+    });
+  }
+
+  writeRepairedColumn_(sheet, secondsColumn, secondsValues, fixedSecondsRows);
+  writeRepairedColumn_(sheet, durationColumn, durationValues, fixedDurationRows);
+
+  return fixedSecondsRows.length + fixedDurationRows.length;
+}
+
+/**
+ * Запись починенных строк блоками: соседние строки — одним диапазоном,
+ * в промежутках записываются те же значения, что там уже стоят.
+ */
+function writeRepairedColumn_(sheet, column, values, fixedRowNumbers) {
+  if (!column || !values || !fixedRowNumbers.length) return;
+
+  collectWriteBlocks_(fixedRowNumbers, OPERATOR_RECALC_MAX_WRITE_GAP).forEach(function(block) {
+    const height = block.end - block.start + 1;
+    const blockValues = values.slice(block.start - 2, block.start - 2 + height);
+
+    sheet.getRange(block.start, column, height, 1).setValues(blockValues);
+  });
+}
+
+function isDateValue_(value) {
+  return Object.prototype.toString.call(value) === '[object Date]';
+}
+
+/**
+ * Дата из ячейки → её серийное число Google Sheets (дни от 1899-12-30).
+ * Для колонки секунд это ровно то число, которое было записано.
+ *
+ * Дата разбирается в часовом поясе таблицы — в нём Sheets её и построил,
+ * поэтому пояс скрипта на результат не влияет.
+ */
+function sheetSerialSeconds_(date, timeZone) {
+  const parts = Utilities
+    .formatDate(date, timeZone, 'yyyy-MM-dd-HH-mm-ss')
+    .split('-')
+    .map(Number);
+
+  const dayMs = Date.UTC(parts[0], parts[1] - 1, parts[2]);
+  const days = (dayMs - SHEET_SERIAL_EPOCH_UTC_MS) / MS_PER_DAY;
+  const dayFraction = (parts[3] * 3600 + parts[4] * 60 + parts[5]) / 86400;
+
+  // Секунды всегда целые (их округляет n8n), поэтому дробная часть — это
+  // только погрешность старых часовых поясов, и её снимает округление.
+  const seconds = Math.round(days + dayFraction);
+
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+}
+
+/**
+ * Секунды → «4:07», при часе и более «1:02:33».
+ * Тот же формат, что делает нода Build Analysis Request в n8n.json.
+ */
+function formatCallDuration_(seconds) {
+  const total = Math.round(Number(seconds));
+
+  if (!Number.isFinite(total) || total <= 0) return '';
+
+  const pad = function(n) { return String(n).length < 2 ? '0' + n : String(n); };
+
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const rest = total % 60;
+
+  return hours > 0
+    ? hours + ':' + pad(minutes) + ':' + pad(rest)
+    : minutes + ':' + pad(rest);
 }
 
 /**

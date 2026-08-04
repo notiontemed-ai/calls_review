@@ -1,70 +1,42 @@
+
 /************************************************************
- * MANGO CALLS → GOOGLE SHEETS → N8N → BITRIX
+ * MANGO CALLS → GOOGLE SHEETS → N8N (ТРАНСКРИБАЦИЯ)
+ * Минимальная версия для отладки.
+ *
+ * Меню: «Обновить список записей» и «Отправить в n8n».
+ * Лог каждого шага пишется на лист «Лог».
+ *
+ * Скрипт привязан к таблице, ID таблицы берётся автоматически.
+ *
+ * КОДИРОВКА (v2): восстанавливаются три случая порчи имён:
+ *  A) CP866-байты прочитаны как MacCyrillic
+ *  B) CP866-байты прочитаны как CP1252
+ *  C) случай B, дополнительно испорченный старым фиксом A
+ *
+ * УНИКАЛЬНОСТЬ (v2): call_key строится из РАЗОБРАННЫХ данных
+ * (дата__время__телефон), а не из имени файла — ключ одинаков
+ * при любой кодировке имени. Старые ключи-имена тоже
+ * учитываются при проверке дублей.
  ************************************************************/
 
 const CONFIG = {
   SOURCE_FOLDER_ID: '18SGE3iAAW7sTo3jeyicgbLGXVxOOdSdy',
 
   SHEET_NAME: 'Записи звонков',
-  PROMPT_SHEET_NAME: 'Промпт',
-  EVALUATION_RESULTS_SHEET_NAME: 'Результаты оценки звонков',
+  LOG_SHEET_NAME: 'Лог',
 
   MAX_FILES_PER_RUN: 500,
-  MAX_SEND_TO_N8N_PER_RUN: 20,
+  MAX_SEND_PER_RUN: 50,
+  MAX_LOG_ROWS: 20000,
 
   RENAME_FILES_ON_DRIVE: true,
 
-  PROP_N8N_WEBHOOK_URL: 'MANGO_N8N_WEBHOOK_URL',
-  PROP_BITRIX_WEBHOOK_BASE_URL: 'MANGO_BITRIX_WEBHOOK_BASE_URL',
-  PROP_BITRIX_RESPONSIBLE_ID: 'MANGO_BITRIX_RESPONSIBLE_ID',
-  PROP_CALLBACK_SECRET: 'MANGO_CALLBACK_SECRET',
-  PROP_CALLBACK_WEBAPP_URL: 'MANGO_CALLBACK_WEBAPP_URL'
+  N8N_WEBHOOK_URL: 'https://n8n-x3.tech.temed.ru/webhook/temed-transcription-intents-v1',
+
+  // Имя заголовка и токен. То же имя и значение — в Header Auth credential в n8n:
+  N8N_SECRET_HEADER: 'X-TEMED-CALLS-SECRET',
+  N8N_SECRET: '10a5a76284052d477a77cb665731e92cf8116d8cc38211ff52baa9f0b6c8557f'
 };
-
-const PROMPT_HEADERS = [
-  'prompt_version',
-  'active',
-  'block_type',
-  'rule_order',
-  'rule_id',
-  'rule_name',
-  'direction_scope',
-  'score_type',
-  'na_allowed',
-  'weight',
-  'critical_if_score_lte',
-  'problem_if_score_lte',
-  'requirement',
-  'score_5',
-  'score_4',
-  'score_3',
-  'score_2',
-  'score_1',
-  'na_condition',
-  'evidence_instruction',
-  'recommendation_instruction'
-];
-
-const EVALUATION_RESULT_HEADERS = [
-  'call_key',
-  'prompt_version',
-  'block_type',
-  'rule_order',
-  'rule_id',
-  'rule_name',
-  'ai_score',
-  'ai_is_na',
-  'ai_reason',
-  'ai_evidence',
-  'ai_recommendation',
-  'manual_score',
-  'manual_is_na',
-  'manual_comment',
-  'reviewer',
-  'review_status',
-  'created_at',
-  'updated_at'
-];
 
 const HEADERS = [
   'call_key',
@@ -85,35 +57,48 @@ const HEADERS = [
   'drive_url',
 
   'status',
-  'transcript_status',
-  'ai_status',
-  'review_status',
-
-  'n8n_status',
-  'n8n_sent_at',
-  'n8n_result_at',
-
-  'prompt_version',
-  'transcript_text',
-  'analysis_summary',
-  'analysis_json',
-  'analysis_score',
-  'is_problem_call',
-  'problem_level',
-  'main_strength',
-  'main_error',
-  'recommended_feedback',
-  'manual_comment',
-  'review_date',
-  'reviewer',
-
-  'bitrix_task_id',
-  'bitrix_task_url',
-
   'error_text',
   'created_at',
-  'updated_at'
+  'updated_at',
+
+  // Колонки транскрибации
+  'call_initiator',
+  'transcription_send_status',
+  'transcription_sent_at',
+  'transcription_received_at',
+  'transcription_error',
+  'raw_transcript',
+  'dialogue_text',
+  'main_intent',
+  'additional_intents',
+  'intent_description',
+  'call_result',
+  'transcription_n8n_execution_id'
 ];
+
+// Колонки, которые заполняет n8n. Их буквы передаются в payload.
+const RESULT_HEADERS = [
+  'transcription_received_at',
+  'transcription_error',
+  'raw_transcript',
+  'dialogue_text',
+  'main_intent',
+  'additional_intents',
+  'intent_description',
+  'call_result',
+  'transcription_n8n_execution_id'
+];
+
+// Подмена технических SIP-адресов Roistat на читаемые названия линий.
+// Ключ — номер из sip_НОМЕР@pbx.roistat.com. Дополняйте по мере появления.
+const SIP_LINE_NAMES = {
+  '79310093200': '',
+  '74993223010': '',
+  '74993223022': ''
+  // '79310093200': 'Roistat Сайт СПб'  ← пример: впишите свои названия
+};
+
+const LOG_HEADERS = ['timestamp', 'run_id', 'step', 'file', 'details'];
 
 /************************************************************
  * MENU
@@ -122,233 +107,555 @@ const HEADERS = [
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Mango записи')
-    .addItem('Создать / проверить лист записей', 'setupMangoCallsSheet')
-    .addItem('Пересоздать лист записей', 'resetMangoCallsSheet')
-    .addItem('Сканировать папку записей', 'scanMangoRecordingsFolder')
+    .addItem('Обновить список записей', 'scanMangoRecordingsFolder')
     .addSeparator()
-    .addItem('Отправить новые звонки в n8n', 'sendNewCallsToN8n')
-    .addItem('Отправить выделенные строки в n8n', 'sendSelectedRowsToN8n')
+    .addItem('Отправить в n8n — 1 запись', 'sendNewCallsToTranscriptionN8n1')
+    .addItem('Отправить в n8n — 10 записей', 'sendNewCallsToTranscriptionN8n10')
+    .addItem('Отправить в n8n — 50 записей', 'sendNewCallsToTranscriptionN8n50')
+    .addItem('Отправить в n8n — 100 записей', 'sendNewCallsToTranscriptionN8n100')
     .addSeparator()
-    .addItem('Создать задачи Bitrix по проблемным звонкам', 'createBitrixTasksForProblemCalls')
-    .addItem('Создать задачи Bitrix по выделенным строкам', 'createBitrixTasksForSelectedRows')
-    .addSeparator()
-    .addItem('Тест: исправить имя из выделенной ячейки', 'testFixSelectedCell')
+    .addItem('Отправить в n8n', 'sendNewCallsToTranscriptionN8n')
     .addToUi();
 }
-
 /************************************************************
- * SETUP SHEETS
- ************************************************************/
-
-function setupMangoCallsSheet() {
-  const sheet = getOrCreateSheet_();
-  ensureHeaders_(sheet);
-  SpreadsheetApp.getActive().toast('Лист проверен: ' + CONFIG.SHEET_NAME);
-}
-
-function resetMangoCallsSheet() {
-  const ui = SpreadsheetApp.getUi();
-  const response = ui.alert(
-    'Пересоздать лист?',
-    'Лист "' + CONFIG.SHEET_NAME + '" будет полностью очищен и создан заново.',
-    ui.ButtonSet.YES_NO
-  );
-
-  if (response !== ui.Button.YES) return;
-
-  const ss = SpreadsheetApp.getActive();
-  let sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
-
-  if (!sheet) {
-    sheet = ss.insertSheet(CONFIG.SHEET_NAME);
-  } else {
-    sheet.clear();
-  }
-
-  sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
-  sheet.setFrozenRows(1);
-  sheet.autoResizeColumns(1, Math.min(HEADERS.length, 12));
-
-  SpreadsheetApp.getActive().toast('Лист пересоздан.');
-}
-
-/************************************************************
- * SCRIPT PROPERTIES
- ************************************************************/
-
-function getScriptProperty_(key) {
-  return String(PropertiesService.getScriptProperties().getProperty(key) || '').trim();
-}
-
-function getRequiredScriptProperty_(key) {
-  const value = getScriptProperty_(key);
-
-  if (!value) {
-    throw new Error(
-      'Не задано свойство скрипта ' + key +
-      '. Укажите его вручную в Project Settings → Script properties.'
-    );
-  }
-
-  return value;
-}
-
-function getCallbackSecret_() {
-  return getRequiredScriptProperty_(CONFIG.PROP_CALLBACK_SECRET);
-}
-
-function getCallbackWebAppUrl_() {
-  return getRequiredScriptProperty_(CONFIG.PROP_CALLBACK_WEBAPP_URL);
-}
-
-/************************************************************
- * SCAN GOOGLE DRIVE
+ * SCAN GOOGLE DRIVE (С ЛОГОМ НА ЛИСТ «Лог»)
  ************************************************************/
 
 function scanMangoRecordingsFolder() {
-  const sheet = getOrCreateSheet_();
-  ensureHeaders_(sheet);
+  const runId = 'run-' + Date.now();
+  const log = [];
 
-  const headerMap = getHeaderMap_(sheet);
-  const existingCallKeys = loadExistingCallKeys_(sheet, headerMap);
+  const push = function(step, file, details) {
+    log.push([
+      nowString_(),
+      runId,
+      String(step || ''),
+      String(file || '').slice(0, 300),
+      String(details || '').slice(0, 2000)
+    ]);
+  };
 
-  const folder = DriveApp.getFolderById(CONFIG.SOURCE_FOLDER_ID);
-  const files = folder.getFiles();
+  try {
+    push('START', '', 'Запуск сканирования');
 
-  let processed = 0;
-  let added = 0;
-  let skippedDuplicates = 0;
-  let renamed = 0;
-  let skippedNotMp3 = 0;
-  let errors = 0;
+    const sheet = getOrCreateSheet_();
+    ensureHeaders_(sheet);
 
-  const rowsToAppend = [];
+    const headerMap = getHeaderMap_(sheet);
+    const existingCallKeys = loadExistingCallKeys_(sheet, headerMap);
 
-  while (files.hasNext() && processed < CONFIG.MAX_FILES_PER_RUN) {
-    const file = files.next();
-    processed++;
+    const rootFolder = DriveApp.getFolderById(CONFIG.SOURCE_FOLDER_ID);
+    push('FOLDER', '', 'ID: ' + CONFIG.SOURCE_FOLDER_ID + ', название: ' + rootFolder.getName());
 
-    try {
-      const filenameRaw = file.getName();
+    // Рекурсивный обход: корневая папка + все вложенные.
+    const folderQueue = [rootFolder];
 
-      if (!isMp3_(filenameRaw)) {
-        skippedNotMp3++;
-        continue;
+    let processed = 0;
+    let added = 0;
+    let skippedDuplicates = 0;
+    let renamed = 0;
+    let skippedNotMp3 = 0;
+    let errors = 0;
+
+    const rowsToAppend = [];
+
+    while (folderQueue.length > 0 && processed < CONFIG.MAX_FILES_PER_RUN) {
+      const currentFolder = folderQueue.shift();
+
+      const subFolders = currentFolder.getFolders();
+      while (subFolders.hasNext()) {
+        const sub = subFolders.next();
+        folderQueue.push(sub);
+        push('SUBFOLDER', '', 'Найдена подпапка: ' + sub.getName());
       }
 
-      const filenameFixed = normalizeMangoFilename_(filenameRaw);
-      const callKey = buildCallKey_(filenameFixed);
+      const files = currentFolder.getFiles();
 
-      if (!callKey) {
-        errors++;
-        continue;
-      }
+      while (files.hasNext() && processed < CONFIG.MAX_FILES_PER_RUN) {
+        const file = files.next();
+        processed++;
 
-      if (existingCallKeys.has(callKey)) {
-        skippedDuplicates++;
+        try {
+          const filenameRaw = file.getName();
 
-        if (CONFIG.RENAME_FILES_ON_DRIVE && filenameFixed !== filenameRaw) {
-          file.setName(filenameFixed);
-          renamed++;
+          push(
+            'FILE',
+            filenameRaw,
+            'MIME: ' + file.getMimeType() + ', размер: ' + file.getSize() + ' байт'
+          );
+
+          if (!isMp3_(filenameRaw)) {
+            skippedNotMp3++;
+            push('SKIP', filenameRaw, 'Пропуск: файл не MP3');
+            continue;
+          }
+
+          const filenameFixed = normalizeMangoFilename_(filenameRaw);
+
+          if (filenameFixed !== filenameRaw) {
+            push('FIXED_NAME', filenameRaw, 'Исправленное имя: ' + filenameFixed);
+          }
+
+          // Сначала разбор — ключ строится из разобранных данных
+          // (дата__время__телефон), независимых от кодировки имени.
+          const parsed = parseMangoFilename_(filenameFixed);
+
+          push(
+            'PARSED',
+            filenameFixed,
+            parsed.error_text
+              ? 'ОШИБКА РАЗБОРА: ' + parsed.error_text
+              : 'direction: ' + parsed.direction +
+                ', client_phone: ' + parsed.client_phone +
+                ', operator: ' + parsed.operator_name +
+                ', datetime: ' + parsed.call_datetime
+          );
+
+          const callKey = buildCallKey_(parsed, filenameFixed);
+          const legacyKey = buildLegacyCallKey_(filenameFixed);
+
+          push('CALL_KEY', filenameFixed, callKey || '(пустой)');
+
+          if (!callKey) {
+            errors++;
+            push('SKIP', filenameFixed, 'Пропуск: не удалось сформировать call_key');
+            continue;
+          }
+
+          // Дубль — если совпал новый ключ ИЛИ старый ключ-имя
+          // (строки, добавленные до перехода на новый формат ключа).
+          if (existingCallKeys.has(callKey) || (legacyKey && existingCallKeys.has(legacyKey))) {
+            skippedDuplicates++;
+            push('DUPLICATE', filenameFixed, 'Дубль по call_key: ' + callKey);
+
+            if (CONFIG.RENAME_FILES_ON_DRIVE && filenameFixed !== filenameRaw) {
+              file.setName(filenameFixed);
+              renamed++;
+              push('RENAMED', filenameRaw, '→ ' + filenameFixed);
+            }
+
+            continue;
+          }
+
+          if (CONFIG.RENAME_FILES_ON_DRIVE && filenameFixed !== filenameRaw) {
+            file.setName(filenameFixed);
+            renamed++;
+            push('RENAMED', filenameRaw, '→ ' + filenameFixed);
+          }
+
+          const now = nowString_();
+
+          const rowObj = {
+            call_key: callKey,
+            filename_raw: filenameRaw,
+            filename_fixed: filenameFixed,
+
+            call_datetime: parsed.call_datetime,
+            call_date: parsed.call_date,
+            call_time: parsed.call_time,
+
+            direction: parsed.direction,
+            client_phone: parsed.client_phone,
+            mango_side: parsed.mango_side,
+            line_name: parsed.line_name,
+            operator_name: parsed.operator_name,
+
+            drive_file_id: file.getId(),
+            drive_url: file.getUrl(),
+
+            status: parsed.error_text ? 'ERROR' : 'NEW',
+            error_text: parsed.error_text,
+            created_at: now,
+            updated_at: now
+          };
+
+          rowsToAppend.push(makeRowByHeaders_(rowObj, headerMap, sheet.getLastColumn()));
+          existingCallKeys.add(callKey);
+          if (legacyKey) existingCallKeys.add(legacyKey);
+          added++;
+
+          push('ROW_PREPARED', filenameFixed, 'Строка подготовлена, call_key: ' + callKey);
+
+        } catch (e) {
+          errors++;
+          push('ERROR', '', String((e && e.stack) || e));
         }
-
-        continue;
       }
-
-      if (CONFIG.RENAME_FILES_ON_DRIVE && filenameFixed !== filenameRaw) {
-        file.setName(filenameFixed);
-        renamed++;
-      }
-
-      const parsed = parseMangoFilename_(filenameFixed);
-      const now = nowString_();
-
-      const rowObj = {
-        call_key: callKey,
-        filename_raw: filenameRaw,
-        filename_fixed: filenameFixed,
-
-        call_datetime: parsed.call_datetime,
-        call_date: parsed.call_date,
-        call_time: parsed.call_time,
-
-        direction: parsed.direction,
-        client_phone: parsed.client_phone,
-        mango_side: parsed.mango_side,
-        line_name: parsed.line_name,
-        operator_name: parsed.operator_name,
-
-        drive_file_id: file.getId(),
-        drive_url: file.getUrl(),
-
-        status: parsed.error_text ? 'ERROR' : 'NEW',
-        transcript_status: '',
-        ai_status: '',
-        review_status: '',
-
-        n8n_status: '',
-        n8n_sent_at: '',
-        n8n_result_at: '',
-
-        prompt_version: '',
-        transcript_text: '',
-        analysis_summary: '',
-        analysis_json: '',
-        analysis_score: '',
-        is_problem_call: '',
-
-        bitrix_task_id: '',
-        bitrix_task_url: '',
-
-        error_text: parsed.error_text,
-        created_at: now,
-        updated_at: now
-      };
-
-      rowsToAppend.push(makeRowByHeaders_(rowObj));
-      existingCallKeys.add(callKey);
-      added++;
-
-    } catch (e) {
-      errors++;
-      Logger.log('Ошибка обработки файла: ' + e.stack);
     }
+
+    if (rowsToAppend.length > 0) {
+      push('WRITE_START', '', 'Запись строк в таблицу: ' + rowsToAppend.length);
+
+      sheet
+        .getRange(sheet.getLastRow() + 1, 1, rowsToAppend.length, rowsToAppend[0].length)
+        .setValues(rowsToAppend);
+
+      push('WRITE_END', '', 'Запись завершена');
+    } else {
+      push('WRITE_SKIP', '', 'Новых строк нет');
+    }
+
+    const message =
+      'Готово. Обработано: ' + processed +
+      ', добавлено: ' + added +
+      ', дублей: ' + skippedDuplicates +
+      ', переименовано: ' + renamed +
+      ', не mp3: ' + skippedNotMp3 +
+      ', ошибок: ' + errors;
+
+    push('FINISH', '', message);
+    SpreadsheetApp.getActive().toast(message);
+
+  } catch (e) {
+    push('FATAL', '', String((e && e.stack) || e));
+    throw e;
+  } finally {
+    flushLog_(log);
   }
-
-  if (rowsToAppend.length > 0) {
-    sheet
-      .getRange(sheet.getLastRow() + 1, 1, rowsToAppend.length, HEADERS.length)
-      .setValues(rowsToAppend);
-  }
-
-  const message =
-    'Готово. Обработано: ' + processed +
-    ', добавлено: ' + added +
-    ', дублей пропущено: ' + skippedDuplicates +
-    ', переименовано: ' + renamed +
-    ', не mp3: ' + skippedNotMp3 +
-    ', ошибок: ' + errors;
-
-  SpreadsheetApp.getActive().toast(message);
-  Logger.log(message);
 }
 
 /************************************************************
- * PARSE MANGO FILENAME
+ * ОТПРАВКА В N8N
  ************************************************************/
 
-function normalizeMangoFilename_(filename) {
-  const original = String(filename || '').normalize('NFC');
-  const decoded = decodeMacCyrillicAsCp866_(original);
-
-  if (shouldUseDecodedName_(original, decoded)) {
-    return sanitizeDriveFilename_(decoded);
-  }
-
-  return sanitizeDriveFilename_(original);
+function sendNewCallsToTranscriptionN8n() {
+  // Старый пункт меню: отправляет все подходящие записи без искусственного лимита.
+  sendNewCallsToTranscriptionN8nWithLimit_(null);
 }
 
-function buildCallKey_(filenameFixed) {
+function sendNewCallsToTranscriptionN8n1() {
+  sendNewCallsToTranscriptionN8nWithLimit_(1);
+}
+
+function sendNewCallsToTranscriptionN8n10() {
+  sendNewCallsToTranscriptionN8nWithLimit_(10);
+}
+
+function sendNewCallsToTranscriptionN8n50() {
+  sendNewCallsToTranscriptionN8nWithLimit_(50);
+}
+
+function sendNewCallsToTranscriptionN8n100() {
+  sendNewCallsToTranscriptionN8nWithLimit_(100);
+}
+
+function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
+  const sendLimit = normalizeSendLimit_(maxToSend);
+  const runId = 'send-' + Date.now();
+
+  // Пишем лог сразу, построчно: если скрипт зависнет или будет
+  // убит по таймауту, уже записанные шаги останутся на листе «Лог».
+  const logSheet = getOrCreateLogSheet_();
+
+  const push = function(step, file, details) {
+    try {
+      logSheet.appendRow([
+        nowString_(),
+        runId,
+        String(step || ''),
+        String(file || '').slice(0, 300),
+        String(details || '').slice(0, 2000)
+      ]);
+      SpreadsheetApp.flush();
+    } catch (e) {
+      Logger.log('Не удалось записать лог: ' + e);
+    }
+  };
+
+  try {
+    push(
+      'START',
+      '',
+      'Запуск отправки в n8n. URL: ' + String(CONFIG.N8N_WEBHOOK_URL) +
+        ', лимит: ' + (sendLimit === null ? 'все подходящие записи' : sendLimit)
+    );
+
+    getWebhookUrl_();
+
+    const sheet = getOrCreateSheet_();
+    ensureHeaders_(sheet);
+
+    const headerMap = getHeaderMap_(sheet);
+    const lastRow = sheet.getLastRow();
+
+    push('SHEET', '', 'Лист: ' + CONFIG.SHEET_NAME + ', строк с данными: ' + Math.max(0, lastRow - 1));
+
+    if (lastRow < 2) {
+      push('FINISH', '', 'Нет строк для отправки.');
+      SpreadsheetApp.getActive().toast('Нет строк для отправки.');
+      return;
+    }
+
+    const values = sheet
+      .getRange(2, 1, lastRow - 1, sheet.getLastColumn())
+      .getValues();
+
+    let sent = 0;
+    let skipped = 0;
+    let errors = 0;
+    let aborted = false;
+
+    for (let i = 0; i < values.length; i++) {
+      if (sendLimit !== null && sent >= sendLimit) {
+        push('LIMIT', '', 'Достигнут лимит отправки за запуск: ' + sendLimit);
+        break;
+      }
+
+      const rowNumber = i + 2;
+      const row = values[i];
+      const callKey = getCellByHeader_(row, headerMap, 'call_key');
+
+      const driveFileId = getCellByHeader_(row, headerMap, 'drive_file_id');
+      const parseError = getCellByHeader_(row, headerMap, 'error_text');
+      const sendStatus = getCellByHeader_(row, headerMap, 'transcription_send_status');
+      const receivedAt = getCellByHeader_(row, headerMap, 'transcription_received_at');
+      const transcriptionError = getCellByHeader_(row, headerMap, 'transcription_error');
+
+      let skipReason = '';
+
+      if (!driveFileId) skipReason = 'нет drive_file_id';
+      else if (parseError) skipReason = 'есть error_text: ' + parseError;
+      else if (sendStatus === 'SENT') skipReason = 'уже отправлено (transcription_send_status = SENT)';
+      else if (receivedAt) skipReason = 'уже есть результат (transcription_received_at заполнено)';
+      // Строки со статусом ERROR НЕ пропускаются — повторяем отправку,
+      // старая ошибка в transcription_error затирается при успехе.
+
+      if (skipReason) {
+        skipped++;
+        push('ROW_SKIP', callKey || ('строка ' + rowNumber), 'Строка ' + rowNumber + ': ' + skipReason);
+        continue;
+      }
+
+      if (transcriptionError) {
+        push('ROW_RETRY', callKey, 'Строка ' + rowNumber + ': повтор после ошибки: ' + transcriptionError.slice(0, 200));
+      }
+
+      try {
+        push('ROW_SEND', callKey, 'Строка ' + rowNumber + ': отправка...');
+        const info = sendTranscriptionRow_(sheet, rowNumber, row, headerMap);
+        sent++;
+        push('ROW_OK', callKey, 'Строка ' + rowNumber + ': n8n принял. Ответ: ' + info);
+      } catch (error) {
+        errors++;
+        const errorMessage = String(error.message || error);
+        push('ROW_ERROR', callKey, 'Строка ' + rowNumber + ': ' + errorMessage);
+        setCellByHeader_(sheet, rowNumber, headerMap, 'transcription_send_status', 'ERROR');
+        setCellByHeader_(sheet, rowNumber, headerMap, 'transcription_error', errorMessage);
+        setCellByHeader_(sheet, rowNumber, headerMap, 'updated_at', nowString_());
+
+        // Сетевая ошибка одинакова для всех строк — прерываем запуск,
+        // чтобы не ждать таймаут по каждой строке.
+        if (errorMessage.indexOf('СЕТЬ:') === 0) {
+          aborted = true;
+          push('ABORT', '', 'Остановка: n8n недоступен. Проверьте адрес, доступность сервера и что workflow активирован.');
+          break;
+        }
+      }
+    }
+
+    const message =
+      'Отправлено: ' + sent +
+      ', пропущено: ' + skipped +
+      ', ошибок: ' + errors +
+      ', лимит: ' + (sendLimit === null ? 'все' : sendLimit) +
+      (aborted ? ' (прервано: n8n недоступен)' : '');
+
+    push('FINISH', '', message);
+    SpreadsheetApp.getActive().toast(message);
+
+  } catch (e) {
+    push('FATAL', '', String((e && e.stack) || e));
+    throw e;
+  }
+}
+
+function normalizeSendLimit_(limit) {
+  if (limit === null || limit === undefined || limit === '') {
+    return null;
+  }
+
+  const n = Number(limit);
+
+  if (!Number.isFinite(n) || n <= 0) {
+    return null;
+  }
+
+  return Math.floor(n);
+}
+function sendTranscriptionRow_(sheet, rowNumber, row, headerMap) {
+  const webhookUrl = getWebhookUrl_();
+
+  const direction = getCellByHeader_(row, headerMap, 'direction');
+  const initiator =
+    direction === 'INBOUND'
+      ? 'Клиент'
+      : direction === 'OUTBOUND'
+        ? 'Оператор'
+        : '';
+
+  // Буквы колонок результата — n8n пишет точно в эти ячейки.
+  const resultColumns = {};
+
+  RESULT_HEADERS.forEach(function(header) {
+    const column = headerMap[header];
+
+    if (!column) {
+      throw new Error('Нет колонки "' + header + '". Запустите «Обновить список записей».');
+    }
+
+    resultColumns[header] = columnToLetter_(column);
+  });
+
+  const payload = {
+    action: 'transcribe_call',
+
+    // ID берётся из самой таблицы — руками нигде не указывается.
+    spreadsheet_id: SpreadsheetApp.getActive().getId(),
+    sheet_name: CONFIG.SHEET_NAME,
+    row_number: rowNumber,
+    result_columns: resultColumns,
+
+    call_key: getCellByHeader_(row, headerMap, 'call_key'),
+    filename_raw: getCellByHeader_(row, headerMap, 'filename_raw'),
+    filename_fixed: getCellByHeader_(row, headerMap, 'filename_fixed'),
+
+    call_datetime: getCellByHeader_(row, headerMap, 'call_datetime'),
+    call_date: getCellByHeader_(row, headerMap, 'call_date'),
+    call_time: getCellByHeader_(row, headerMap, 'call_time'),
+
+    direction: direction,
+    initiator: initiator,
+    client_phone: getCellByHeader_(row, headerMap, 'client_phone'),
+    mango_side: getCellByHeader_(row, headerMap, 'mango_side'),
+    line_name: getCellByHeader_(row, headerMap, 'line_name'),
+    operator_name: getCellByHeader_(row, headerMap, 'operator_name'),
+
+    drive_file_id: getCellByHeader_(row, headerMap, 'drive_file_id'),
+    drive_url: getCellByHeader_(row, headerMap, 'drive_url')
+  };
+
+  if (!payload.call_key) {
+    throw new Error('В строке нет call_key');
+  }
+
+  if (!payload.drive_file_id) {
+    throw new Error('В строке нет drive_file_id');
+  }
+
+  if (!payload.direction) {
+    throw new Error('Не определено направление звонка');
+  }
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+    headers: {}
+  };
+
+  options.headers[CONFIG.N8N_SECRET_HEADER] = CONFIG.N8N_SECRET;
+
+  let response;
+
+  try {
+    response = UrlFetchApp.fetch(webhookUrl, options);
+  } catch (e) {
+    // Сюда попадают DNS/connect/timeout — сервер вообще не ответил.
+    throw new Error('СЕТЬ: ' + String(e.message || e));
+  }
+
+  const statusCode = response.getResponseCode();
+  const responseText = response.getContentText();
+
+  if (statusCode < 200 || statusCode >= 300) {
+    throw new Error('n8n вернул HTTP ' + statusCode + ': ' + responseText);
+  }
+
+  const now = nowString_();
+
+  setCellByHeader_(sheet, rowNumber, headerMap, 'call_initiator', initiator);
+  setCellByHeader_(sheet, rowNumber, headerMap, 'transcription_send_status', 'SENT');
+  setCellByHeader_(sheet, rowNumber, headerMap, 'transcription_sent_at', now);
+  setCellByHeader_(sheet, rowNumber, headerMap, 'transcription_error', '');
+  setCellByHeader_(sheet, rowNumber, headerMap, 'updated_at', now);
+
+  return 'HTTP ' + statusCode + ' ' + String(responseText || '').slice(0, 300);
+}
+
+function getWebhookUrl_() {
+  const url = String(CONFIG.N8N_WEBHOOK_URL || '').trim();
+
+  if (!url || url.indexOf('ВАШ-N8N-ХОСТ') !== -1) {
+    throw new Error(
+      'В CONFIG.N8N_WEBHOOK_URL не указан адрес вашего n8n. ' +
+      'Замените "ВАШ-N8N-ХОСТ" на реальный хост.'
+    );
+  }
+
+  return url;
+}
+
+/************************************************************
+ * ЛОГ (ЛИСТ «Лог»)
+ ************************************************************/
+
+function getOrCreateLogSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sheet = ss.getSheetByName(CONFIG.LOG_SHEET_NAME);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(CONFIG.LOG_SHEET_NAME);
+  }
+
+  ensureSheetHeaders_(sheet, LOG_HEADERS);
+  return sheet;
+}
+
+function flushLog_(rows) {
+  if (!rows || rows.length === 0) return;
+
+  try {
+    const sheet = getOrCreateLogSheet_();
+
+    if (sheet.getLastRow() > CONFIG.MAX_LOG_ROWS) {
+      sheet
+        .getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn())
+        .clearContent();
+    }
+
+    sheet
+      .getRange(sheet.getLastRow() + 1, 1, rows.length, LOG_HEADERS.length)
+      .setValues(rows);
+  } catch (e) {
+    Logger.log('Не удалось записать лог: ' + e);
+  }
+}
+
+/************************************************************
+ * CALL KEY
+ ************************************************************/
+
+/**
+ * Новый ключ: дата__время__телефон из РАЗОБРАННЫХ данных.
+ * Не зависит от кодировки имени файла: как бы ни была испорчена
+ * кириллица, цифры даты/времени/телефона всегда доезжают целыми,
+ * поэтому один и тот же звонок при любом экспорте даёт один ключ.
+ * Если разбор не удался — fallback на каноническое имя файла.
+ */
+function buildCallKey_(parsed, filenameFixed) {
+  if (parsed && parsed.call_date && parsed.call_time && parsed.client_phone) {
+    return parsed.call_date + '__' + parsed.call_time.replace(/:/g, '-') + '__' + parsed.client_phone;
+  }
+
+  return buildLegacyCallKey_(filenameFixed);
+}
+
+/**
+ * Старый ключ (имя файла без расширения) — для сверки со строками,
+ * добавленными до перехода на новый формат.
+ */
+function buildLegacyCallKey_(filenameFixed) {
   const base = stripExtension_(filenameFixed).trim();
 
   if (!base) return '';
@@ -357,6 +664,10 @@ function buildCallKey_(filenameFixed) {
     .replace(/\s+/g, ' ')
     .trim();
 }
+
+/************************************************************
+ * PARSE MANGO FILENAME
+ ************************************************************/
 
 /**
  * Форматы:
@@ -458,7 +769,7 @@ function parseMangoFilename_(filenameFixed) {
 }
 
 function parseMangoSide_(mangoSide) {
-  const text = String(mangoSide || '').trim();
+  const text = humanizeSipName_(String(mangoSide || '').trim());
   const tokens = text.split(/\s+/).filter(Boolean);
 
   const result = {
@@ -466,7 +777,8 @@ function parseMangoSide_(mangoSide) {
     operator_name: ''
   };
 
-  if (tokens.length >= 3) {
+  // У Roistat-линий оператора в имени нет — не пытаемся его выделять.
+  if (!/^Roistat\b/i.test(text) && tokens.length >= 3) {
     result.operator_name = tokens.slice(-2).join(' ');
     result.line_name = tokens.slice(0, -2).join(' ');
   }
@@ -474,1143 +786,19 @@ function parseMangoSide_(mangoSide) {
   return result;
 }
 
-/************************************************************
- * PROMPT CONFIG
- ************************************************************/
-
-function getPromptHeaderMap_(sheet) {
-  if (sheet.getLastColumn() < 1) {
-    throw new Error(
-      'На листе "' + CONFIG.PROMPT_SHEET_NAME + '" не найдены обязательные колонки: ' +
-      PROMPT_HEADERS.join(', ') + '.'
-    );
-  }
-
-  const headerMap = getHeaderMap_(sheet);
-  const missingHeaders = PROMPT_HEADERS.filter(header => !headerMap[header]);
-
-  if (missingHeaders.length > 0) {
-    throw new Error(
-      'На листе "' + CONFIG.PROMPT_SHEET_NAME + '" не найдены обязательные колонки: ' +
-      missingHeaders.join(', ') + '.'
-    );
-  }
-
-  return headerMap;
-}
-
-function readPromptConfig_(direction) {
-  const ss = SpreadsheetApp.getActive();
-  const sheet = ss.getSheetByName(CONFIG.PROMPT_SHEET_NAME);
-
-  if (!sheet) {
-    throw new Error('Не найден лист "' + CONFIG.PROMPT_SHEET_NAME + '". Создайте его вручную и заполните правилами оценки.');
-  }
-
-  const headerMap = getPromptHeaderMap_(sheet);
-  const lastRow = sheet.getLastRow();
-
-  if (lastRow < 2) {
-    throw new Error('На листе "Промпт" не найдено активных правил оценки.');
-  }
-
-  const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
-  const normalizedDirection = String(direction || '').trim().toUpperCase();
-  const configs = {};
-  const rules = [];
-
-  values.forEach(row => {
-    const record = rowToObject_(row, headerMap);
-    const blockType = String(record.block_type || '').trim().toUpperCase();
-    const ruleId = String(record.rule_id || '').trim();
-
-    if (blockType === 'CONFIG') {
-      if (ruleId) configs[ruleId] = String(record.requirement || '').trim();
-      return;
-    }
-
-    if (['GENERAL', 'STAGE'].indexOf(blockType) === -1) return;
-    if (!isTruthy_(record.active)) return;
-
-    const directionScope = String(record.direction_scope || 'BOTH').trim().toUpperCase();
-
-    if (normalizedDirection && directionScope !== 'BOTH' && directionScope !== normalizedDirection) {
-      return;
-    }
-
-    rules.push(normalizeEvaluationRule_(record));
-  });
-
-  ['transcription_prompt', 'analysis_system_prompt', 'output_schema', 'prompt_version'].forEach(ruleId => {
-    if (!configs[ruleId]) {
-      throw new Error('На листе "Промпт" не найдена CONFIG-строка ' + ruleId + '.');
-    }
-  });
-
-  rules.sort((a, b) => Number(a.rule_order || 0) - Number(b.rule_order || 0));
-
-  if (rules.length === 0) {
-    throw new Error('На листе "Промпт" не найдено активных правил оценки.');
-  }
-
-  return {
-    prompt_version: configs.prompt_version,
-    transcription_prompt: configs.transcription_prompt,
-    analysis_system_prompt: configs.analysis_system_prompt,
-    output_schema: configs.output_schema,
-    evaluation_rules: rules
-  };
-}
-
-function normalizeEvaluationRule_(record) {
-  return {
-    prompt_version: String(record.prompt_version || '').trim(),
-    active: isTruthy_(record.active),
-    block_type: String(record.block_type || '').trim().toUpperCase(),
-    rule_order: toNumberOrBlank_(record.rule_order),
-    rule_id: String(record.rule_id || '').trim(),
-    rule_name: String(record.rule_name || '').trim(),
-    direction_scope: String(record.direction_scope || 'BOTH').trim().toUpperCase(),
-    score_type: String(record.score_type || 'SCORE_1_5').trim().toUpperCase(),
-    na_allowed: isTruthy_(record.na_allowed),
-    weight: toNumberOrBlank_(record.weight) || 1,
-    critical_if_score_lte: toNumberOrBlank_(record.critical_if_score_lte),
-    problem_if_score_lte: toNumberOrBlank_(record.problem_if_score_lte),
-    requirement: String(record.requirement || '').trim(),
-    score_5: String(record.score_5 || '').trim(),
-    score_4: String(record.score_4 || '').trim(),
-    score_3: String(record.score_3 || '').trim(),
-    score_2: String(record.score_2 || '').trim(),
-    score_1: String(record.score_1 || '').trim(),
-    na_condition: String(record.na_condition || '').trim(),
-    evidence_instruction: String(record.evidence_instruction || '').trim(),
-    recommendation_instruction: String(record.recommendation_instruction || '').trim()
-  };
-}
-
-function readPromptRulesById_(direction) {
-  const config = readPromptConfig_(direction);
-  const map = {};
-
-  config.evaluation_rules.forEach(rule => {
-    map[rule.rule_id] = rule;
-  });
-
-  return {
-    prompt_version: config.prompt_version,
-    rules: config.evaluation_rules,
-    map: map
-  };
-}
-
-/************************************************************
- * SEND TO N8N
- ************************************************************/
-
-function sendNewCallsToN8n() {
-  const sheet = getOrCreateSheet_();
-  ensureHeaders_(sheet);
-
-  const headerMap = getHeaderMap_(sheet);
-  const promptConfig = null;
-
-  getRequiredScriptProperty_(CONFIG.PROP_N8N_WEBHOOK_URL);
-  getCallbackSecret_();
-  getCallbackWebAppUrl_();
-
-  const lastRow = sheet.getLastRow();
-
-  if (lastRow < 2) {
-    SpreadsheetApp.getActive().toast('Нет строк для отправки.');
-    return;
-  }
-
-  const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
-
-  let sent = 0;
-  let skipped = 0;
-  let errors = 0;
-
-  for (let i = 0; i < values.length; i++) {
-    if (sent >= CONFIG.MAX_SEND_TO_N8N_PER_RUN) break;
-
-    const rowIndex = i + 2;
-    const row = values[i];
-
-    const status = getCellByHeader_(row, headerMap, 'status');
-    const n8nStatus = getCellByHeader_(row, headerMap, 'n8n_status');
-    const errorText = getCellByHeader_(row, headerMap, 'error_text');
-
-    if (errorText) {
-      skipped++;
-      continue;
-    }
-
-    if (status !== 'NEW') {
-      skipped++;
-      continue;
-    }
-
-    if (n8nStatus === 'SENT_TO_N8N' || n8nStatus === 'ANALYZED') {
-      skipped++;
-      continue;
-    }
-
-    try {
-      sendRowToN8n_(sheet, rowIndex, row, headerMap, promptConfig);
-      sent++;
-    } catch (e) {
-      errors++;
-      setCellByHeader_(sheet, rowIndex, headerMap, 'n8n_status', 'N8N_ERROR');
-      setCellByHeader_(sheet, rowIndex, headerMap, 'status', 'N8N_ERROR');
-      setCellByHeader_(sheet, rowIndex, headerMap, 'error_text', String(e.message || e));
-      setCellByHeader_(sheet, rowIndex, headerMap, 'updated_at', nowString_());
-    }
-  }
-
-  SpreadsheetApp.getActive().toast(
-    'Отправка в n8n завершена. Отправлено: ' + sent +
-    ', пропущено: ' + skipped +
-    ', ошибок: ' + errors
-  );
-}
-
-function sendSelectedRowsToN8n() {
-  const sheet = getOrCreateSheet_();
-  ensureHeaders_(sheet);
-
-  const range = SpreadsheetApp.getActiveRange();
-
-  if (!range) {
-    SpreadsheetApp.getUi().alert('Выдели строки, которые нужно отправить в n8n.');
-    return;
-  }
-
-  const headerMap = getHeaderMap_(sheet);
-  const promptConfig = null;
-
-  getRequiredScriptProperty_(CONFIG.PROP_N8N_WEBHOOK_URL);
-  getCallbackSecret_();
-  getCallbackWebAppUrl_();
-
-  const startRow = range.getRow();
-  const numRows = range.getNumRows();
-
-  let sent = 0;
-  let errors = 0;
-
-  for (let r = startRow; r < startRow + numRows; r++) {
-    if (r === 1) continue;
-
-    const row = sheet.getRange(r, 1, 1, sheet.getLastColumn()).getValues()[0];
-
-    try {
-      const errorText = getCellByHeader_(row, headerMap, 'error_text');
-
-      if (errorText) {
-        throw new Error('Строка содержит ошибку парсинга: ' + errorText);
-      }
-
-      sendRowToN8n_(sheet, r, row, headerMap, promptConfig);
-      sent++;
-    } catch (e) {
-      errors++;
-      setCellByHeader_(sheet, r, headerMap, 'n8n_status', 'N8N_ERROR');
-      setCellByHeader_(sheet, r, headerMap, 'status', 'N8N_ERROR');
-      setCellByHeader_(sheet, r, headerMap, 'error_text', String(e.message || e));
-      setCellByHeader_(sheet, r, headerMap, 'updated_at', nowString_());
-    }
-  }
-
-  SpreadsheetApp.getActive().toast(
-    'Выделенные строки отправлены. Отправлено: ' + sent + ', ошибок: ' + errors
-  );
-}
-
-function sendRowToN8n_(sheet, rowIndex, row, headerMap, promptConfig) {
-  const directionForRules = getCellByHeader_(row, headerMap, 'direction');
-  promptConfig = readPromptConfig_(directionForRules);
-
-  if (!promptConfig.evaluation_rules || promptConfig.evaluation_rules.length === 0) {
-    throw new Error('Нет активных правил оценки для направления ' + directionForRules);
-  }
-
-  const n8nWebhookUrl = getRequiredScriptProperty_(CONFIG.PROP_N8N_WEBHOOK_URL);
-  const callbackSecret = getCallbackSecret_();
-  const callbackUrl = getCallbackWebAppUrl_();
-
-  const payload = {
-    action: 'transcribe_and_analyze_call',
-    secret: callbackSecret,
-
-    call_key: getCellByHeader_(row, headerMap, 'call_key'),
-    filename_fixed: getCellByHeader_(row, headerMap, 'filename_fixed'),
-
-    call_datetime: getCellByHeader_(row, headerMap, 'call_datetime'),
-    call_date: getCellByHeader_(row, headerMap, 'call_date'),
-    call_time: getCellByHeader_(row, headerMap, 'call_time'),
-
-    direction: getCellByHeader_(row, headerMap, 'direction'),
-    client_phone: getCellByHeader_(row, headerMap, 'client_phone'),
-    mango_side: getCellByHeader_(row, headerMap, 'mango_side'),
-    line_name: getCellByHeader_(row, headerMap, 'line_name'),
-    operator_name: getCellByHeader_(row, headerMap, 'operator_name'),
-
-    drive_file_id: getCellByHeader_(row, headerMap, 'drive_file_id'),
-    drive_url: getCellByHeader_(row, headerMap, 'drive_url'),
-
-    prompt_version: promptConfig.prompt_version,
-
-    prompts: {
-      prompt_version: promptConfig.prompt_version,
-      transcription_prompt: promptConfig.transcription_prompt,
-      analysis_system_prompt: promptConfig.analysis_system_prompt,
-      output_schema: promptConfig.output_schema || '',
-      evaluation_rules: promptConfig.evaluation_rules
-    },
-
-    callback: {
-      url: callbackUrl,
-      secret: callbackSecret
-    }
-  };
-
-  if (!payload.call_key) {
-    throw new Error('В строке нет call_key');
-  }
-
-  if (!payload.drive_file_id) {
-    throw new Error('В строке нет drive_file_id');
-  }
-
-  const response = UrlFetchApp.fetch(n8nWebhookUrl, {
-    method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  });
-
-  const code = response.getResponseCode();
-  const body = response.getContentText();
-
-  if (code < 200 || code >= 300) {
-    throw new Error('n8n вернул HTTP ' + code + ': ' + body);
-  }
-
-  const now = nowString_();
-
-  setCellByHeader_(sheet, rowIndex, headerMap, 'status', 'SENT_TO_N8N');
-  setCellByHeader_(sheet, rowIndex, headerMap, 'n8n_status', 'SENT_TO_N8N');
-  setCellByHeader_(sheet, rowIndex, headerMap, 'n8n_sent_at', now);
-  setCellByHeader_(sheet, rowIndex, headerMap, 'prompt_version', promptConfig.prompt_version);
-  setCellByHeader_(sheet, rowIndex, headerMap, 'error_text', '');
-  setCellByHeader_(sheet, rowIndex, headerMap, 'updated_at', now);
-}
-
-/************************************************************
- * CALLBACK FROM N8N
- ************************************************************/
-
-function doPost(e) {
-  try {
-    const body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
-
-    const expectedSecret = getCallbackSecret_();
-
-    if (body.secret !== expectedSecret) {
-      return jsonResponse_({
-        ok: false,
-        error: 'Forbidden: bad secret'
-      });
-    }
-
-    if (body.action === 'ping') {
-      return jsonResponse_({
-        ok: true,
-        message: 'pong'
-      });
-    }
-
-    if (body.action === 'n8n_call_result') {
-      const result = saveN8nCallResult_(body);
-
-      return jsonResponse_({
-        ok: true,
-        result: result
-      });
-    }
-
-    if (body.action === 'save_manual_call_review') {
-      const result = saveManualCallReview_(body);
-
-      return jsonResponse_({
-        ok: true,
-        result: result
-      });
-    }
-
-    if (body.action === 'n8n_call_error') {
-      const result = saveN8nCallError_(body);
-
-      return jsonResponse_({
-        ok: true,
-        result: result
-      });
-    }
-
-    return jsonResponse_({
-      ok: false,
-      error: 'Unknown action: ' + body.action
-    });
-
-  } catch (err) {
-    return jsonResponse_({
-      ok: false,
-      error: String(err.message || err)
-    });
-  }
-}
-
-function doGet(e) {
-  const callKey = String(e && e.parameter && e.parameter.call_key || '').trim();
-  const html = callKey ? renderCallReviewPage_(callKey) : renderAnalyzedCallsListPage_();
-
-  return HtmlService
-    .createHtmlOutput(html)
-    .setTitle(callKey ? 'Проверка звонка' : 'Последние проанализированные звонки');
-}
-
-function saveN8nCallResult_(body) {
-  const sheet = getOrCreateSheet_();
-  ensureHeaders_(sheet);
-
-  const headerMap = getHeaderMap_(sheet);
-  const callKey = String(body.call_key || '').trim();
-
-  if (!callKey) {
-    throw new Error('В callback нет call_key');
-  }
-
-  const rowIndex = findRowByCallKey_(sheet, headerMap, callKey);
-
-  if (!rowIndex) {
-    throw new Error('Не найдена строка по call_key: ' + callKey);
-  }
-
-  const now = nowString_();
-
-  const transcriptText = String(body.transcript_text || '');
-
-  let analysis = body.analysis || {};
-
-  if (typeof analysis === 'string') {
-    analysis = safeJsonParse_(analysis) || {
-      raw: analysis
-    };
-  }
-
-  const analysisJson = JSON.stringify(analysis, null, 2);
-
-  const summary = String(
-    analysis.summary ||
-    body.analysis_summary ||
-    ''
-  );
-
-  const score = String(
-    analysis.overall_score ||
-    analysis.score_1_5 ||
-    analysis.score ||
-    body.analysis_score ||
-    ''
-  );
-
-  const isProblem = normalizeBooleanForSheet_(
-    analysis.is_problem_call !== undefined
-      ? analysis.is_problem_call
-      : body.is_problem_call
-  );
-
-  setCellByHeader_(sheet, rowIndex, headerMap, 'transcript_text', transcriptText);
-  setCellByHeader_(sheet, rowIndex, headerMap, 'analysis_json', analysisJson);
-  setCellByHeader_(sheet, rowIndex, headerMap, 'analysis_summary', summary);
-  setCellByHeader_(sheet, rowIndex, headerMap, 'analysis_score', score);
-  setCellByHeader_(sheet, rowIndex, headerMap, 'is_problem_call', isProblem);
-  setCellByHeader_(sheet, rowIndex, headerMap, 'problem_level', String(analysis.problem_level || ''));
-  setCellByHeader_(sheet, rowIndex, headerMap, 'main_strength', String(analysis.main_strength || ''));
-  setCellByHeader_(sheet, rowIndex, headerMap, 'main_error', String(analysis.main_error || ''));
-  setCellByHeader_(sheet, rowIndex, headerMap, 'recommended_feedback', String(analysis.recommended_feedback || ''));
-
-  upsertEvaluationResults_(callKey, getCellByHeader_(sheet.getRange(rowIndex, 1, 1, sheet.getLastColumn()).getValues()[0], headerMap, 'direction'), analysis);
-
-  setCellByHeader_(sheet, rowIndex, headerMap, 'transcript_status', transcriptText ? 'OK' : '');
-  setCellByHeader_(sheet, rowIndex, headerMap, 'ai_status', analysisJson ? 'OK' : '');
-
-  setCellByHeader_(sheet, rowIndex, headerMap, 'n8n_status', 'ANALYZED');
-  setCellByHeader_(sheet, rowIndex, headerMap, 'status', 'ANALYZED');
-  setCellByHeader_(sheet, rowIndex, headerMap, 'n8n_result_at', now);
-  setCellByHeader_(sheet, rowIndex, headerMap, 'error_text', '');
-  setCellByHeader_(sheet, rowIndex, headerMap, 'updated_at', now);
-
-  return {
-    call_key: callKey,
-    row: rowIndex
-  };
-}
-
-function saveN8nCallError_(body) {
-  const sheet = getOrCreateSheet_();
-  ensureHeaders_(sheet);
-
-  const headerMap = getHeaderMap_(sheet);
-  const callKey = String(body.call_key || '').trim();
-
-  if (!callKey) {
-    throw new Error('В callback error нет call_key');
-  }
-
-  const rowIndex = findRowByCallKey_(sheet, headerMap, callKey);
-
-  if (!rowIndex) {
-    throw new Error('Не найдена строка по call_key: ' + callKey);
-  }
-
-  const now = nowString_();
-
-  setCellByHeader_(sheet, rowIndex, headerMap, 'n8n_status', 'N8N_ERROR');
-  setCellByHeader_(sheet, rowIndex, headerMap, 'status', 'N8N_ERROR');
-  setCellByHeader_(sheet, rowIndex, headerMap, 'error_text', String(body.error_text || body.error || 'Ошибка n8n'));
-  setCellByHeader_(sheet, rowIndex, headerMap, 'n8n_result_at', now);
-  setCellByHeader_(sheet, rowIndex, headerMap, 'updated_at', now);
-
-  return {
-    call_key: callKey,
-    row: rowIndex
-  };
-}
-
-
-
-/************************************************************
- * WEB REVIEW UI
- ************************************************************/
-
-function renderAnalyzedCallsListPage_() {
-  const sheet = getOrCreateSheet_();
-  ensureHeaders_(sheet);
-  const headerMap = getHeaderMap_(sheet);
-  const lastRow = sheet.getLastRow();
-  const callbackUrl = getCallbackWebAppUrl_();
-  const rows = [];
-
-  if (lastRow >= 2) {
-    const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
-    for (let i = values.length - 1; i >= 0 && rows.length < 50; i--) {
-      const row = values[i];
-      if (getCellByHeader_(row, headerMap, 'status') === 'ANALYZED') {
-        const callKey = getCellByHeader_(row, headerMap, 'call_key');
-        rows.push('<tr><td><a href="' + htmlEscape_(callbackUrl + '?call_key=' + encodeURIComponent(callKey)) + '">' + htmlEscape_(callKey) + '</a></td><td>' + htmlEscape_(getCellByHeader_(row, headerMap, 'call_datetime')) + '</td><td>' + htmlEscape_(getCellByHeader_(row, headerMap, 'operator_name')) + '</td><td>' + htmlEscape_(getCellByHeader_(row, headerMap, 'analysis_score')) + '</td><td>' + htmlEscape_(getCellByHeader_(row, headerMap, 'problem_level')) + '</td></tr>');
-      }
-    }
-  }
-
-  return wrapReviewHtml_('Последние проанализированные звонки', '<h1>Последние проанализированные звонки</h1><table><thead><tr><th>call_key</th><th>Дата/время</th><th>Оператор</th><th>AI оценка</th><th>Уровень</th></tr></thead><tbody>' + rows.join('') + '</tbody></table>');
-}
-
-function renderCallReviewPage_(callKey) {
-  const sheet = getOrCreateSheet_();
-  ensureHeaders_(sheet);
-  const headerMap = getHeaderMap_(sheet);
-  const rowIndex = findRowByCallKey_(sheet, headerMap, callKey);
-
-  if (!rowIndex) {
-    return wrapReviewHtml_('Звонок не найден', '<h1>Звонок не найден</h1><p>call_key: ' + htmlEscape_(callKey) + '</p>');
-  }
-
-  const row = sheet.getRange(rowIndex, 1, 1, sheet.getLastColumn()).getValues()[0];
-  const analysis = safeJsonParse_(getCellByHeader_(row, headerMap, 'analysis_json')) || {};
-  const results = loadEvaluationResultsForCall_(callKey);
-  const generalRows = results.filter(r => r.block_type === 'GENERAL');
-  const stageRows = results.filter(r => r.block_type === 'STAGE');
-  const secret = getCallbackSecret_();
-  const driveUrl = getCellByHeader_(row, headerMap, 'drive_url');
-  const driveFileId = getCellByHeader_(row, headerMap, 'drive_file_id');
-  const audioUrl = driveFileId ? 'https://drive.google.com/uc?export=download&id=' + encodeURIComponent(driveFileId) : '';
-
-  const card = [
-    '<section class="card"><h1>Проверка звонка</h1><dl class="grid">',
-    detailHtml_('Дата/время', getCellByHeader_(row, headerMap, 'call_datetime')),
-    detailHtml_('Направление', getCellByHeader_(row, headerMap, 'direction')),
-    detailHtml_('Оператор', getCellByHeader_(row, headerMap, 'operator_name')),
-    detailHtml_('Линия', getCellByHeader_(row, headerMap, 'line_name')),
-    detailHtml_('Телефон клиента', getCellByHeader_(row, headerMap, 'client_phone')),
-    detailHtml_('Статус', getCellByHeader_(row, headerMap, 'status')),
-    detailHtml_('AI оценка', getCellByHeader_(row, headerMap, 'analysis_score')),
-    detailHtml_('Уровень проблемы', getCellByHeader_(row, headerMap, 'problem_level')),
-    '</dl><p><a target="_blank" href="' + htmlEscape_(driveUrl) + '">Открыть аудио в Google Drive</a> · <a target="_blank" href="' + htmlEscape_(getCellByHeader_(row, headerMap, 'bitrix_task_url') || '#') + '">Создать задачу Bitrix</a></p>',
-    audioUrl ? '<audio controls preload="none" src="' + htmlEscape_(audioUrl) + '"></audio>' : '',
-    '</section>'
-  ].join('');
-
-  const aiBlock = '<section class="card"><h2>Итог AI</h2>' +
-    '<p><b>Краткое содержание:</b> ' + htmlEscape_(analysis.summary || getCellByHeader_(row, headerMap, 'analysis_summary')) + '</p>' +
-    '<p><b>Главная сильная сторона:</b> ' + htmlEscape_(analysis.main_strength || getCellByHeader_(row, headerMap, 'main_strength')) + '</p>' +
-    '<p><b>Главная ошибка:</b> ' + htmlEscape_(analysis.main_error || getCellByHeader_(row, headerMap, 'main_error')) + '</p>' +
-    '<p><b>Рекомендация оператору:</b> ' + htmlEscape_(analysis.recommended_feedback || getCellByHeader_(row, headerMap, 'recommended_feedback')) + '</p></section>';
-
-  const form = '<form id="reviewForm">' +
-    renderRulesTable_('Сквозные требования', 'Правило', generalRows) +
-    renderRulesTable_('Этапы разговора', 'Этап', stageRows) +
-    '<section class="card"><h2>Итоговое решение проверяющего</h2>' +
-    '<select name="review_status"><option value="AI_OK">AI верно</option><option value="HAS_QUESTIONS">Есть вопросы</option><option value="OPERATOR_GROSS_ERROR">Грубая ошибка оператора</option><option value="AI_ERROR">Ошибка AI</option></select>' +
-    '<textarea name="manual_comment" placeholder="Комментарий проверяющего">' + htmlEscape_(getCellByHeader_(row, headerMap, 'manual_comment')) + '</textarea>' +
-    '<button type="submit">Сохранить проверку</button><span id="saveStatus"></span></section></form>';
-
-  const script = '<script>const CALL_KEY=' + JSON.stringify(callKey) + ';const SECRET=' + JSON.stringify(secret) + ';' +
-    'document.getElementById("reviewForm").addEventListener("submit",async function(ev){ev.preventDefault();const rows=[...document.querySelectorAll("tr[data-rule-id]")];const rule_reviews=rows.map(r=>{const v=r.querySelector("select").value;return{rule_id:r.dataset.ruleId,manual_score:v&&v!=="N/A"?Number(v):"",manual_is_na:v==="N/A",manual_comment:r.querySelector("textarea").value};});const payload={action:"save_manual_call_review",secret:SECRET,call_key:CALL_KEY,review_status:this.review_status.value,manual_comment:this.manual_comment.value,rule_reviews:rule_reviews};const res=await fetch(location.href,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const data=await res.json();document.getElementById("saveStatus").textContent=data.ok?" Сохранено":" Ошибка: "+data.error;});</script>';
-
-  return wrapReviewHtml_('Проверка звонка', card + aiBlock + form + script);
-}
-
-function renderRulesTable_(title, firstColumnTitle, rows) {
-  const body = rows.map(r => {
-    const manualValue = isTruthy_(r.manual_is_na) ? 'N/A' : String(r.manual_score || '');
-    return '<tr data-rule-id="' + htmlEscape_(r.rule_id) + '"><td>' + htmlEscape_(r.rule_name || r.rule_id) + '</td><td>' + htmlEscape_(formatAiScore_(r.ai_score, r.ai_is_na)) + '</td><td>' + renderManualScoreSelect_(manualValue) + '</td><td>' + htmlEscape_(r.ai_reason) + '</td><td>' + htmlEscape_(r.ai_evidence) + '</td><td>' + htmlEscape_(r.ai_recommendation) + '</td><td><textarea>' + htmlEscape_(r.manual_comment) + '</textarea></td></tr>';
-  }).join('');
-
-  return '<section class="card"><h2>' + htmlEscape_(title) + '</h2><table><thead><tr><th>' + htmlEscape_(firstColumnTitle) + '</th><th>AI оценка</th><th>Ручная оценка</th><th>Обоснование AI</th><th>Фрагмент / наблюдение</th><th>Рекомендация</th><th>Комментарий проверяющего</th></tr></thead><tbody>' + body + '</tbody></table></section>';
-}
-
-function renderManualScoreSelect_(value) {
-  const options = ['', '1', '2', '3', '4', '5', 'N/A'];
-  return '<select>' + options.map(option => '<option value="' + option + '"' + (option === value ? ' selected' : '') + '>' + (option || 'пусто') + '</option>').join('') + '</select>';
-}
-
-function loadEvaluationResultsForCall_(callKey) {
-  const sheet = getOrCreateEvaluationResultsSheet_();
-  const headerMap = getHeaderMap_(sheet);
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return [];
-
-  const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
-  return values.map(row => rowToObject_(row, headerMap))
-    .filter(obj => String(obj.call_key || '').trim() === callKey)
-    .sort((a, b) => Number(a.rule_order || 0) - Number(b.rule_order || 0));
-}
-
-function wrapReviewHtml_(title, body) {
-  return '<!doctype html><html><head><base target="_top"><meta charset="utf-8"><title>' + htmlEscape_(title) + '</title><style>body{font-family:Arial,sans-serif;background:#f6f7fb;margin:0;padding:24px;color:#172033}.card{background:#fff;border-radius:14px;padding:18px;margin:0 0 18px;box-shadow:0 2px 10px #0001}.grid{display:grid;grid-template-columns:180px 1fr;gap:8px 16px}dt{font-weight:700}table{width:100%;border-collapse:collapse;background:#fff}th,td{border:1px solid #dde2eb;padding:8px;vertical-align:top}th{background:#eef2f8}textarea{width:100%;min-height:64px}select,button{padding:8px}audio{width:100%;margin-top:12px}</style></head><body>' + body + '</body></html>';
-}
-
-function detailHtml_(label, value) {
-  return '<dt>' + htmlEscape_(label) + '</dt><dd>' + htmlEscape_(value || '—') + '</dd>';
-}
-
-function formatAiScore_(score, isNa) {
-  return isTruthy_(isNa) ? 'N/A' : (score || '');
-}
-
-function htmlEscape_(value) {
-  return String(value === null || value === undefined ? '' : value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-/************************************************************
- * EVALUATION RESULTS AND MANUAL REVIEW
- ************************************************************/
-
-function getOrCreateEvaluationResultsSheet_() {
-  const ss = SpreadsheetApp.getActive();
-  let sheet = ss.getSheetByName(CONFIG.EVALUATION_RESULTS_SHEET_NAME);
-
-  if (!sheet) {
-    sheet = ss.insertSheet(CONFIG.EVALUATION_RESULTS_SHEET_NAME);
-  }
-
-  ensureSheetHeaders_(sheet, EVALUATION_RESULT_HEADERS);
-  return sheet;
-}
-
-function readPromptRulesForCallback_(direction) {
-  try {
-    return readPromptRulesById_(direction);
-  } catch (e) {
-    const ss = SpreadsheetApp.getActive();
-    const sheet = ss.getSheetByName(CONFIG.PROMPT_SHEET_NAME);
-    const result = { prompt_version: '', rules: [], map: {} };
-
-    if (!sheet || sheet.getLastRow() < 2) return result;
-
-    let headerMap;
-
-    try {
-      headerMap = getPromptHeaderMap_(sheet);
-    } catch (headerError) {
-      return result;
-    }
-    const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-    const normalizedDirection = String(direction || '').trim().toUpperCase();
-
-    values.forEach(row => {
-      const record = rowToObject_(row, headerMap);
-      const blockType = String(record.block_type || '').trim().toUpperCase();
-      if (['GENERAL', 'STAGE'].indexOf(blockType) === -1) return;
-      if (!isTruthy_(record.active)) return;
-
-      const directionScope = String(record.direction_scope || 'BOTH').trim().toUpperCase();
-      if (normalizedDirection && directionScope !== 'BOTH' && directionScope !== normalizedDirection) return;
-
-      const rule = normalizeEvaluationRule_(record);
-      if (!result.prompt_version && rule.prompt_version) result.prompt_version = rule.prompt_version;
-      result.rules.push(rule);
-      result.map[rule.rule_id] = rule;
-    });
-
-    result.rules.sort((a, b) => Number(a.rule_order || 0) - Number(b.rule_order || 0));
-    return result;
-  }
-}
-
-function upsertEvaluationResults_(callKey, direction, analysis) {
-  const sheet = getOrCreateEvaluationResultsSheet_();
-  const headerMap = getHeaderMap_(sheet);
-  const promptData = readPromptRulesForCallback_(direction);
-  const now = nowString_();
-  const resultByRuleId = {};
-
-  (analysis.rule_results || []).forEach(result => {
-    const ruleId = String(result.rule_id || '').trim();
-    if (ruleId) resultByRuleId[ruleId] = result;
-  });
-
-  const ruleIds = promptData.rules.map(rule => rule.rule_id);
-  Object.keys(resultByRuleId).forEach(ruleId => {
-    if (ruleIds.indexOf(ruleId) === -1) ruleIds.push(ruleId);
-  });
-
-  ruleIds.forEach(ruleId => {
-    const rule = promptData.map[ruleId] || {
-      prompt_version: promptData.prompt_version,
-      block_type: '',
-      rule_order: '',
-      rule_id: ruleId,
-      rule_name: 'Неизвестное правило',
-      na_allowed: true
-    };
-    const aiResult = resultByRuleId[ruleId] || null;
-    let aiReason = aiResult ? String(aiResult.reason || '') : 'AI не вернул оценку по этому правилу';
-    const aiIsNa = aiResult ? normalizeBooleanForSheet_(aiResult.is_na) : '';
-
-    if (aiResult && isTruthy_(aiIsNa) && !rule.na_allowed) {
-      aiReason = '[Предупреждение: правило не допускает N/A, но AI вернул is_na = true.] ' + aiReason;
-    }
-
-    const rowIndex = findEvaluationResultRow_(sheet, headerMap, callKey, ruleId);
-    const rowObj = {
-      call_key: callKey,
-      prompt_version: rule.prompt_version || promptData.prompt_version,
-      block_type: rule.block_type || '',
-      rule_order: rule.rule_order || '',
-      rule_id: ruleId,
-      rule_name: rule.rule_name || 'Неизвестное правило',
-      ai_score: aiResult && aiResult.score !== null && aiResult.score !== undefined ? aiResult.score : '',
-      ai_is_na: aiIsNa,
-      ai_reason: aiReason,
-      ai_evidence: aiResult ? String(aiResult.evidence || '') : '',
-      ai_recommendation: aiResult ? String(aiResult.recommendation || '') : '',
-      updated_at: now
-    };
-
-    if (rowIndex) {
-      Object.keys(rowObj).forEach(key => setCellByHeader_(sheet, rowIndex, headerMap, key, rowObj[key]));
-    } else {
-      rowObj.created_at = now;
-      sheet.appendRow(EVALUATION_RESULT_HEADERS.map(h => Object.prototype.hasOwnProperty.call(rowObj, h) ? rowObj[h] : ''));
-    }
-  });
-}
-
-function saveManualCallReview_(body) {
-  const callKey = String(body.call_key || '').trim();
-  if (!callKey) throw new Error('Не передан call_key для ручной проверки');
-
-  const reviewStatus = String(body.review_status || '').trim();
-  const manualComment = String(body.manual_comment || '').trim();
-  const reviewer = getReviewerEmail_();
-  const now = nowString_();
-
-  const resultsSheet = getOrCreateEvaluationResultsSheet_();
-  const resultsHeaderMap = getHeaderMap_(resultsSheet);
-  const reviews = body.rule_reviews || [];
-
-  reviews.forEach(review => {
-    const ruleId = String(review.rule_id || '').trim();
-    if (!ruleId) return;
-
-    let rowIndex = findEvaluationResultRow_(resultsSheet, resultsHeaderMap, callKey, ruleId);
-
-    if (!rowIndex) {
-      resultsSheet.appendRow(EVALUATION_RESULT_HEADERS.map(h => {
-        if (h === 'call_key') return callKey;
-        if (h === 'rule_id') return ruleId;
-        if (h === 'rule_name') return 'Неизвестное правило';
-        if (h === 'created_at' || h === 'updated_at') return now;
-        return '';
-      }));
-      rowIndex = resultsSheet.getLastRow();
-    }
-
-    setCellByHeader_(resultsSheet, rowIndex, resultsHeaderMap, 'manual_score', review.manual_score === null || review.manual_score === undefined ? '' : review.manual_score);
-    setCellByHeader_(resultsSheet, rowIndex, resultsHeaderMap, 'manual_is_na', normalizeBooleanForSheet_(review.manual_is_na));
-    setCellByHeader_(resultsSheet, rowIndex, resultsHeaderMap, 'manual_comment', String(review.manual_comment || ''));
-    setCellByHeader_(resultsSheet, rowIndex, resultsHeaderMap, 'reviewer', reviewer);
-    setCellByHeader_(resultsSheet, rowIndex, resultsHeaderMap, 'review_status', reviewStatus);
-    setCellByHeader_(resultsSheet, rowIndex, resultsHeaderMap, 'updated_at', now);
-  });
-
-  const callsSheet = getOrCreateSheet_();
-  ensureHeaders_(callsSheet);
-  const callsHeaderMap = getHeaderMap_(callsSheet);
-  const callRow = findRowByCallKey_(callsSheet, callsHeaderMap, callKey);
-
-  if (callRow) {
-    setCellByHeader_(callsSheet, callRow, callsHeaderMap, 'review_status', reviewStatus);
-    setCellByHeader_(callsSheet, callRow, callsHeaderMap, 'manual_comment', manualComment);
-    setCellByHeader_(callsSheet, callRow, callsHeaderMap, 'review_date', now);
-    setCellByHeader_(callsSheet, callRow, callsHeaderMap, 'reviewer', reviewer);
-    setCellByHeader_(callsSheet, callRow, callsHeaderMap, 'updated_at', now);
-  }
-
-  return {
-    call_key: callKey,
-    saved_rules: reviews.length
-  };
-}
-
-function findEvaluationResultRow_(sheet, headerMap, callKey, ruleId) {
-  const callKeyCol = headerMap.call_key;
-  const ruleIdCol = headerMap.rule_id;
-  if (!callKeyCol || !ruleIdCol) return null;
-
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return null;
-
-  const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
-  for (let i = 0; i < values.length; i++) {
-    if (String(values[i][callKeyCol - 1] || '').trim() === callKey && String(values[i][ruleIdCol - 1] || '').trim() === ruleId) {
-      return i + 2;
-    }
-  }
-
-  return null;
-}
-
-function getReviewerEmail_() {
-  try {
-    return String(Session.getActiveUser().getEmail() || '').trim();
-  } catch (e) {
-    return '';
-  }
-}
-
-/************************************************************
- * BITRIX TASKS
- ************************************************************/
-
-function createBitrixTasksForProblemCalls() {
-  const sheet = getOrCreateSheet_();
-  ensureHeaders_(sheet);
-
-  const headerMap = getHeaderMap_(sheet);
-
-  getRequiredScriptProperty_(CONFIG.PROP_BITRIX_WEBHOOK_BASE_URL);
-  getRequiredScriptProperty_(CONFIG.PROP_BITRIX_RESPONSIBLE_ID);
-
-  const lastRow = sheet.getLastRow();
-
-  if (lastRow < 2) {
-    SpreadsheetApp.getActive().toast('Нет строк.');
-    return;
-  }
-
-  const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
-
-  let created = 0;
-  let skipped = 0;
-  let errors = 0;
-
-  for (let i = 0; i < values.length; i++) {
-    const rowIndex = i + 2;
-    const row = values[i];
-
-    const status = getCellByHeader_(row, headerMap, 'status');
-    const isProblem = getCellByHeader_(row, headerMap, 'is_problem_call');
-    const taskId = getCellByHeader_(row, headerMap, 'bitrix_task_id');
-
-    if (status !== 'ANALYZED') {
-      skipped++;
-      continue;
-    }
-
-    if (!isTruthy_(isProblem)) {
-      skipped++;
-      continue;
-    }
-
-    if (taskId) {
-      skipped++;
-      continue;
-    }
-
-    try {
-      createBitrixTaskForRow_(sheet, rowIndex, row, headerMap);
-      created++;
-    } catch (e) {
-      errors++;
-      setCellByHeader_(sheet, rowIndex, headerMap, 'error_text', String(e.message || e));
-      setCellByHeader_(sheet, rowIndex, headerMap, 'updated_at', nowString_());
-    }
-  }
-
-  SpreadsheetApp.getActive().toast(
-    'Bitrix: создано ' + created + ', пропущено ' + skipped + ', ошибок ' + errors
-  );
-}
-
-function createBitrixTasksForSelectedRows() {
-  const sheet = getOrCreateSheet_();
-  ensureHeaders_(sheet);
-
-  const range = SpreadsheetApp.getActiveRange();
-
-  if (!range) {
-    SpreadsheetApp.getUi().alert('Выдели строки, по которым нужно создать задачи.');
-    return;
-  }
-
-  const headerMap = getHeaderMap_(sheet);
-
-  getRequiredScriptProperty_(CONFIG.PROP_BITRIX_WEBHOOK_BASE_URL);
-  getRequiredScriptProperty_(CONFIG.PROP_BITRIX_RESPONSIBLE_ID);
-
-  let created = 0;
-  let errors = 0;
-
-  for (let r = range.getRow(); r < range.getRow() + range.getNumRows(); r++) {
-    if (r === 1) continue;
-
-    const row = sheet.getRange(r, 1, 1, sheet.getLastColumn()).getValues()[0];
-
-    try {
-      createBitrixTaskForRow_(sheet, r, row, headerMap);
-      created++;
-    } catch (e) {
-      errors++;
-      setCellByHeader_(sheet, r, headerMap, 'error_text', String(e.message || e));
-      setCellByHeader_(sheet, r, headerMap, 'updated_at', nowString_());
-    }
-  }
-
-  SpreadsheetApp.getActive().toast(
-    'Bitrix по выделенным: создано ' + created + ', ошибок ' + errors
-  );
-}
-
-function createBitrixTaskForRow_(sheet, rowIndex, row, headerMap) {
-  const existingTaskId = getCellByHeader_(row, headerMap, 'bitrix_task_id');
-
-  if (existingTaskId) {
-    throw new Error('Задача Bitrix уже создана: ' + existingTaskId);
-  }
-
-  const webhookBase = normalizeBitrixWebhookBase_(
-    getRequiredScriptProperty_(CONFIG.PROP_BITRIX_WEBHOOK_BASE_URL)
-  );
-
-  const responsibleId = getRequiredScriptProperty_(CONFIG.PROP_BITRIX_RESPONSIBLE_ID);
-
-  const callKey = getCellByHeader_(row, headerMap, 'call_key');
-  const callDateTime = getCellByHeader_(row, headerMap, 'call_datetime');
-  const direction = getCellByHeader_(row, headerMap, 'direction');
-  const clientPhone = getCellByHeader_(row, headerMap, 'client_phone');
-  const mangoSide = getCellByHeader_(row, headerMap, 'mango_side');
-  const operatorName = getCellByHeader_(row, headerMap, 'operator_name');
-  const driveUrl = getCellByHeader_(row, headerMap, 'drive_url');
-  const analysisSummary = getCellByHeader_(row, headerMap, 'analysis_summary');
-  const analysisScore = getCellByHeader_(row, headerMap, 'analysis_score');
-  const analysisJson = getCellByHeader_(row, headerMap, 'analysis_json');
-  const transcriptText = getCellByHeader_(row, headerMap, 'transcript_text');
-  const problemLevel = getCellByHeader_(row, headerMap, 'problem_level');
-  const mainError = getCellByHeader_(row, headerMap, 'main_error');
-  const recommendedFeedback = getCellByHeader_(row, headerMap, 'recommended_feedback');
-  const reviewUrl = buildCallReviewUrl_(callKey);
-  const problematicRulesText = buildProblematicRulesText_(callKey, analysisJson);
-
-  const title = 'Проверить проблемный звонок: ' + callDateTime + ' / ' + clientPhone;
-
-  const description = [
-    'Проблемный звонок по результатам AI-анализа.',
-    '',
-    'Дата/время: ' + callDateTime,
-    'Направление: ' + direction,
-    'Оператор: ' + operatorName,
-    'Телефон клиента: ' + clientPhone,
-    'Линия: ' + mangoSide,
-    '',
-    'Аудиозапись:',
-    driveUrl,
-    '',
-    'AI-оценка: ' + analysisScore,
-    'Уровень проблемы: ' + problemLevel,
-    'Краткое содержание: ' + (analysisSummary || '—'),
-    'Главная ошибка: ' + (mainError || '—'),
-    'Рекомендация оператору: ' + (recommendedFeedback || '—'),
-    '',
-    'Ссылка на страницу проверки:',
-    reviewUrl || '—',
-    '',
-    'Проблемные правила:',
-    problematicRulesText || '—',
-    '',
-    'Транскрипт:',
-    truncateText_(transcriptText || '—', 4000),
-    '',
-    'call_key:',
-    callKey
-  ].join('\n');
-
-  const url = webhookBase + '/tasks.task.add.json';
-
-  const payload = {
-    fields: {
-      TITLE: title,
-      DESCRIPTION: description,
-      RESPONSIBLE_ID: Number(responsibleId)
-    }
-  };
-
-  const response = UrlFetchApp.fetch(url, {
-    method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  });
-
-  const code = response.getResponseCode();
-  const body = response.getContentText();
-
-  if (code < 200 || code >= 300) {
-    throw new Error('Bitrix HTTP ' + code + ': ' + body);
-  }
-
-  const data = safeJsonParse_(body);
-
-  if (!data) {
-    throw new Error('Bitrix вернул не JSON: ' + body);
-  }
-
-  if (data.error) {
-    throw new Error('Bitrix error: ' + data.error + ' ' + (data.error_description || ''));
-  }
-
-  const taskId =
-    data.result &&
-    data.result.task &&
-    data.result.task.id
-      ? data.result.task.id
-      : data.result && data.result.id
-        ? data.result.id
-        : data.result;
-
-  if (!taskId) {
-    throw new Error('Не удалось получить ID задачи Bitrix: ' + body);
-  }
-
-  const taskUrl = buildBitrixTaskUrl_(webhookBase, responsibleId, taskId);
-  const now = nowString_();
-
-  setCellByHeader_(sheet, rowIndex, headerMap, 'bitrix_task_id', String(taskId));
-  setCellByHeader_(sheet, rowIndex, headerMap, 'bitrix_task_url', taskUrl);
-  setCellByHeader_(sheet, rowIndex, headerMap, 'updated_at', now);
-
-  return {
-    task_id: taskId,
-    task_url: taskUrl
-  };
-}
-
-function buildCallReviewUrl_(callKey) {
-  try {
-    return getCallbackWebAppUrl_() + '?call_key=' + encodeURIComponent(callKey);
-  } catch (e) {
-    return '';
-  }
-}
-
-function buildProblematicRulesText_(callKey, analysisJson) {
-  const analysis = safeJsonParse_(analysisJson) || {};
-  const results = loadEvaluationResultsForCall_(callKey);
-  const lines = [];
-
-  results.forEach(result => {
-    const score = toNumberOrBlank_(result.ai_score);
-    if (score === '') return;
-
-    const ruleMeta = findRuleMetadataById_(result.rule_id);
-    const critical = ruleMeta ? toNumberOrBlank_(ruleMeta.critical_if_score_lte) : '';
-    const problem = ruleMeta ? toNumberOrBlank_(ruleMeta.problem_if_score_lte) : '';
-    const isProblemRule = (critical !== '' && score <= critical) || (problem !== '' && score <= problem);
-
-    if (!isProblemRule) return;
-
-    lines.push([
-      'Правило: ' + (result.rule_name || result.rule_id),
-      'Оценка: ' + score,
-      'Почему: ' + (result.ai_reason || '—'),
-      'Рекомендация: ' + (result.ai_recommendation || '—')
-    ].join('\n'));
-  });
-
-  if (lines.length === 0 && analysis.rule_results) {
-    return '';
-  }
-
-  return lines.join('\n\n');
-}
-
-function findRuleMetadataById_(ruleId) {
-  const ss = SpreadsheetApp.getActive();
-  const sheet = ss.getSheetByName(CONFIG.PROMPT_SHEET_NAME);
-  if (!sheet || sheet.getLastRow() < 2) return null;
-
-  const headerMap = getPromptHeaderMap_(sheet);
-  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-
-  for (let i = 0; i < values.length; i++) {
-    const record = rowToObject_(values[i], headerMap);
-    if (String(record.rule_id || '').trim() === ruleId) {
-      return normalizeEvaluationRule_(record);
-    }
-  }
-
-  return null;
-}
-
-function normalizeBitrixWebhookBase_(url) {
-  return String(url || '').trim().replace(/\/+$/, '');
-}
-
-function buildBitrixTaskUrl_(webhookBase, responsibleId, taskId) {
-  const match = String(webhookBase || '').match(/^(https?:\/\/[^/]+)/i);
-  const origin = match ? match[1] : '';
-
-  if (!origin) return '';
-
-  return origin + '/company/personal/user/' + responsibleId + '/tasks/task/view/' + taskId + '/';
+/**
+ * sip_79310093200@pbx.roistat.com → «Roistat 79310093200»
+ * или название из SIP_LINE_NAMES, если задано.
+ */
+function humanizeSipName_(text) {
+  const match = String(text || '').match(/^sip_(\d{7,15})@pbx\.roistat\.com$/i);
+
+  if (!match) return text;
+
+  const number = match[1];
+  const custom = String(SIP_LINE_NAMES[number] || '').trim();
+
+  return custom || ('Roistat ' + number);
 }
 
 /************************************************************
@@ -1629,38 +817,7 @@ function getOrCreateSheet_() {
 }
 
 function ensureHeaders_(sheet) {
-  const lastRow = sheet.getLastRow();
-  const lastColumn = sheet.getLastColumn();
-
-  if (lastRow === 0 || lastColumn === 0) {
-    sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
-    sheet.setFrozenRows(1);
-    return;
-  }
-
-  const firstRow = sheet
-    .getRange(1, 1, 1, Math.max(lastColumn, HEADERS.length))
-    .getValues()[0]
-    .map(String)
-    .map(s => s.trim());
-
-  const existingHeaders = firstRow.filter(Boolean);
-
-  if (existingHeaders.length === 0) {
-    sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
-    sheet.setFrozenRows(1);
-    return;
-  }
-
-  const missing = HEADERS.filter(h => existingHeaders.indexOf(h) === -1);
-
-  if (missing.length > 0) {
-    sheet
-      .getRange(1, existingHeaders.length + 1, 1, missing.length)
-      .setValues([missing]);
-  }
-
-  sheet.setFrozenRows(1);
+  ensureSheetHeaders_(sheet, HEADERS);
 }
 
 function ensureSheetHeaders_(sheet, headers) {
@@ -1717,28 +874,48 @@ function getHeaderMap_(sheet) {
 function loadExistingCallKeys_(sheet, headerMap) {
   const set = new Set();
 
-  const callKeyCol = headerMap.call_key;
-  if (!callKeyCol) return set;
-
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return set;
 
-  const values = sheet
-    .getRange(2, callKeyCol, lastRow - 1, 1)
-    .getValues();
+  // Учитываем и call_key, и старые ключи-имена (filename_fixed без
+  // расширения) — чтобы строки старого формата тоже считались дублями.
+  const callKeyCol = headerMap.call_key;
+  const fixedCol = headerMap.filename_fixed;
 
-  values.forEach(row => {
-    const key = String(row[0] || '').trim();
-    if (key) set.add(key);
-  });
+  if (callKeyCol) {
+    sheet.getRange(2, callKeyCol, lastRow - 1, 1).getValues().forEach(row => {
+      const key = String(row[0] || '').trim();
+      if (key) set.add(key);
+    });
+  }
+
+  if (fixedCol) {
+    sheet.getRange(2, fixedCol, lastRow - 1, 1).getValues().forEach(row => {
+      const legacy = buildLegacyCallKey_(String(row[0] || ''));
+      if (legacy) set.add(legacy);
+    });
+  }
 
   return set;
 }
 
-function makeRowByHeaders_(obj) {
-  return HEADERS.map(h => {
-    return Object.prototype.hasOwnProperty.call(obj, h) ? obj[h] : '';
+/**
+ * Строит строку по фактическим позициям колонок листа,
+ * а не по порядку в HEADERS — безопасно при любом
+ * расположении колонок.
+ */
+function makeRowByHeaders_(obj, headerMap, lastColumn) {
+  const width = Math.max(lastColumn, 1);
+  const row = new Array(width).fill('');
+
+  Object.keys(obj).forEach(function(header) {
+    const column = headerMap[header];
+    if (column && column <= width) {
+      row[column - 1] = obj[header];
+    }
   });
+
+  return row;
 }
 
 function getCellByHeader_(row, headerMap, headerName) {
@@ -1759,62 +936,22 @@ function setCellByHeader_(sheet, rowIndex, headerMap, headerName, value) {
   sheet.getRange(rowIndex, col).setValue(value);
 }
 
-function findRowByCallKey_(sheet, headerMap, callKey) {
-  const col = headerMap.call_key;
+function columnToLetter_(column) {
+  let letter = '';
+  let n = Number(column);
 
-  if (!col) {
-    throw new Error('Нет колонки call_key');
+  while (n > 0) {
+    const mod = (n - 1) % 26;
+    letter = String.fromCharCode(65 + mod) + letter;
+    n = Math.floor((n - 1) / 26);
   }
 
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return null;
-
-  const values = sheet.getRange(2, col, lastRow - 1, 1).getValues();
-
-  for (let i = 0; i < values.length; i++) {
-    if (String(values[i][0] || '').trim() === callKey) {
-      return i + 2;
-    }
-  }
-
-  return null;
-}
-
-function rowToObject_(row, headerMap) {
-  const obj = {};
-
-  Object.keys(headerMap).forEach(header => {
-    obj[header] = row[headerMap[header] - 1];
-  });
-
-  return obj;
-}
-
-function toNumberOrBlank_(value) {
-  if (value === '' || value === null || value === undefined) return '';
-  const n = Number(String(value).replace(',', '.'));
-  return isNaN(n) ? '' : n;
+  return letter;
 }
 
 /************************************************************
  * HELPERS: GENERAL
  ************************************************************/
-
-function testFixSelectedCell() {
-  const range = SpreadsheetApp.getActiveRange();
-
-  if (!range) {
-    SpreadsheetApp.getUi().alert('Выдели ячейку с кривым названием файла.');
-    return;
-  }
-
-  const raw = String(range.getValue() || '');
-  const fixed = normalizeMangoFilename_(raw);
-
-  range.offset(0, 1).setValue(fixed);
-
-  SpreadsheetApp.getActive().toast('Исправленное имя записано в ячейку справа.');
-}
 
 function isPhone_(value) {
   return /^\d{7,15}$/.test(String(value || '').trim());
@@ -1843,62 +980,47 @@ function nowString_() {
   );
 }
 
-function jsonResponse_(obj) {
-  return ContentService
-    .createTextOutput(JSON.stringify(obj))
-    .setMimeType(ContentService.MimeType.JSON);
-}
-
-function safeJsonParse_(text) {
-  try {
-    return JSON.parse(String(text || ''));
-  } catch (e) {
-    return null;
-  }
-}
-
-function truncateText_(text, maxLength) {
-  const s = String(text || '');
-
-  if (s.length <= maxLength) return s;
-
-  return s.slice(0, maxLength) + '\n\n...[обрезано, всего символов: ' + s.length + ']';
-}
-
-function normalizeBooleanForSheet_(value) {
-  if (value === true) return 'TRUE';
-  if (value === false) return 'FALSE';
-
-  const s = String(value || '').trim().toLowerCase();
-
-  if (['true', '1', 'yes', 'да', 'истина'].indexOf(s) !== -1) return 'TRUE';
-  if (['false', '0', 'no', 'нет', 'ложь'].indexOf(s) !== -1) return 'FALSE';
-
-  return '';
-}
-
-function isTruthy_(value) {
-  const s = String(value || '').trim().toLowerCase();
-  return ['true', '1', 'yes', 'да', 'истина'].indexOf(s) !== -1;
-}
-
 /************************************************************
- * ENCODING FIX
+ * ENCODING FIX v2
+ *
+ * Покрываемые случаи порчи имён:
+ *  A) CP866-байты прочитаны как MacCyrillic
+ *  B) CP866-байты прочитаны как CP1252
+ *  C) случай B, дополнительно испорченный старым фиксом A
  ************************************************************/
 
-function shouldUseDecodedName_(original, decoded) {
-  if (!decoded || original === decoded) return false;
+function normalizeMangoFilename_(filename) {
+  const original = String(filename || '').normalize('NFC');
 
-  if (!hasSuspiciousEncodingChars_(original)) return false;
+  if (!hasSuspiciousEncodingChars_(original)) {
+    return sanitizeDriveFilename_(original);
+  }
 
-  const originalScore = filenameHumanScore_(original);
-  const decodedScore = filenameHumanScore_(decoded);
+  const candidates = [
+    decodeMacCyrillicAsCp866_(original),                        // случай A
+    decodeCp1252AsCp866_(original),                             // случай B
+    decodeCp1252AsCp866_(undoMacCyrillicFix_(original))         // случай C
+  ];
 
-  return decodedScore > originalScore;
+  let best = original;
+  let bestScore = filenameHumanScore_(original);
+
+  for (const candidate of candidates) {
+    if (!candidate || candidate === original) continue;
+    const score = filenameHumanScore_(candidate);
+    if (score > bestScore) {
+      best = candidate;
+      bestScore = score;
+    }
+  }
+
+  return sanitizeDriveFilename_(best);
 }
 
 function hasSuspiciousEncodingChars_(text) {
-  return /[\u0300-\u036F†‡¶®©™ЂЃ§ҐґЈјЅѕЉљЊњЋћЌќЇїІіЄєµ≤≥≈∆∞±√ƒ«»…]/.test(String(text || ''));
+  // Box-drawing/блоки (╘╩╟╔ и т.п.), CP1252-артефакты (Š ¤ ¦ ¥ ¢ ª и др.),
+  // MacCyrillic-артефакты («»®™ и др.), латиница с диакритикой.
+  return /[\u0300-\u036F\u2500-\u25FF†‡¶®©™ЂЃ§ҐґЈјЅѕЉљЊњЋћЌќЇїІіЄєµ≤≥≈∆∞±√ƒ«»…€‚„‰Š‹ŒŽšžŸ¤¦¥¢ª¨¬°·¿Ààáâãäåæçèéêëìíîïðñòóôõöùúûüýþÿ]/.test(String(text || ''));
 }
 
 function filenameHumanScore_(text) {
@@ -1906,15 +1028,14 @@ function filenameHumanScore_(text) {
 
   const russianLetters = (s.match(/[А-Яа-яЁё]/g) || []).length;
   const digits = (s.match(/\d/g) || []).length;
-  const suspicious = (s.match(/[\u0300-\u036F†‡¶®©™ЂЃ§ҐґЈјЅѕЉљЊњЋћЌќЇїІіЄєµ≤≥≈∆∞±√ƒ«»…]/g) || []).length;
+  const suspicious = (s.match(/[\u0300-\u036F\u2500-\u25FF†‡¶®©™ЂЃ§ҐґЈјЅѕЉљЊњЋћЌќЇїІіЄєµ≤≥≈∆∞±√ƒ«»…€‚„‰Š‹ŒŽšžŸ¤¦¥¢ª¨¬¿Ààáâãäåæçèéêëìíîïðñòóôõöùúûüýþÿ]/g) || []).length;
   const replacement = (s.match(/�/g) || []).length;
 
   return russianLetters * 3 + digits - suspicious * 8 - replacement * 20;
 }
 
 /**
- * Восстановление случая:
- * CP866 / DOS Cyrillic был прочитан как MacCyrillic.
+ * Случай A: CP866-байты были прочитаны как MacCyrillic.
  */
 function decodeMacCyrillicAsCp866_(text) {
   const source = String(text || '').normalize('NFC');
@@ -1953,6 +1074,107 @@ function decodeMacCyrillicAsCp866_(text) {
 }
 
 /**
+ * Случай B: имя в CP866 было прочитано как CP1252.
+ * Символ → байт по таблице CP1252, байт → символ CP866.
+ */
+function decodeCp1252AsCp866_(text) {
+  const source = String(text || '').normalize('NFC');
+
+  const cp1252Chars = getCp1252Chars128_();
+  const cp866Chars = getCp866Chars128_();
+
+  const cp1252CharToByte = {};
+
+  for (let i = 0; i < cp1252Chars.length; i++) {
+    if (cp1252Chars[i]) cp1252CharToByte[cp1252Chars[i]] = 128 + i;
+  }
+  // NBSP встречается и после нормализаций — → 0xA0 ('а' в CP866)
+  cp1252CharToByte['\u00A0'] = 0xA0;
+
+  let result = '';
+
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    const code = ch.charCodeAt(0);
+
+    if (code <= 127) {
+      result += ch;
+      continue;
+    }
+
+    // Байты без символа в CP1252 (0x81,0x8D,0x8F,0x90,0x9D) часто доезжают
+    // как невидимые управляющие U+0080–U+009F — используем код как байт.
+    if (code >= 0x80 && code <= 0x9F && cp1252CharToByte[ch] === undefined) {
+      result += cp866Chars[code - 128] || ch;
+      continue;
+    }
+
+    const byteValue = cp1252CharToByte[ch];
+
+    if (byteValue === undefined) {
+      result += ch;
+      continue;
+    }
+
+    result += cp866Chars[byteValue - 128] || ch;
+  }
+
+  return result;
+}
+
+/**
+ * Откат старого фикса (для случая C): символ CP866 → байт,
+ * байт → символ MacCyrillic. Возвращает строку к виду,
+ * который был ДО применения decodeMacCyrillicAsCp866_.
+ */
+function undoMacCyrillicFix_(text) {
+  const source = String(text || '').normalize('NFC');
+
+  const cp866Chars = getCp866Chars128_();
+  const macChars = getMacCyrillicChars128_();
+
+  const cp866CharToByte = {};
+
+  for (let i = 0; i < cp866Chars.length; i++) {
+    if (cp866CharToByte[cp866Chars[i]] === undefined) {
+      cp866CharToByte[cp866Chars[i]] = 128 + i;
+    }
+  }
+
+  let result = '';
+
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    const code = ch.charCodeAt(0);
+
+    if (code <= 127) {
+      result += ch;
+      continue;
+    }
+
+    const byteValue = cp866CharToByte[ch];
+
+    if (byteValue === undefined) {
+      result += ch;
+      continue;
+    }
+
+    const macChar = macChars[byteValue - 128] || '';
+
+    // Откатываем только артефакты: если MacCyr-прообраз — кириллица,
+    // символ двусмысленен (например «¤»/«е») и его трогать нельзя.
+    if (/[А-Яа-яЁё]/.test(macChar)) {
+      result += ch;
+      continue;
+    }
+
+    result += macChar || ch;
+  }
+
+  return result;
+}
+
+/**
  * CP866: байты 128–255.
  */
 function getCp866Chars128_() {
@@ -1981,5 +1203,21 @@ function getMacCyrillicChars128_() {
     '\u2013', '\u2014', '\u201C', '\u201D', '\u2018', '\u2019', '\u00F7', '\u201E', '\u040E', '\u045E', '\u040F', '\u045F', '\u2116', '\u0401', '\u0451', '\u044F',
     '\u0430', '\u0431', '\u0432', '\u0433', '\u0434', '\u0435', '\u0436', '\u0437', '\u0438', '\u0439', '\u043A', '\u043B', '\u043C', '\u043D', '\u043E', '\u043F',
     '\u0440', '\u0441', '\u0442', '\u0443', '\u0444', '\u0445', '\u0446', '\u0447', '\u0448', '\u0449', '\u044A', '\u044B', '\u044C', '\u044D', '\u044E', '\u20AC'
+  ];
+}
+
+/**
+ * CP1252: байты 128–255. Пустые позиции (0x81, 0x8D, 0x8F, 0x90, 0x9D) — null.
+ */
+function getCp1252Chars128_() {
+  return [
+    '\u20AC', null, '\u201A', '\u0192', '\u201E', '\u2026', '\u2020', '\u2021', '\u02C6', '\u2030', '\u0160', '\u2039', '\u0152', null, '\u017D', null,
+    null, '\u2018', '\u2019', '\u201C', '\u201D', '\u2022', '\u2013', '\u2014', '\u02DC', '\u2122', '\u0161', '\u203A', '\u0153', null, '\u017E', '\u0178',
+    '\u00A0', '\u00A1', '\u00A2', '\u00A3', '\u00A4', '\u00A5', '\u00A6', '\u00A7', '\u00A8', '\u00A9', '\u00AA', '\u00AB', '\u00AC', '\u00AD', '\u00AE', '\u00AF',
+    '\u00B0', '\u00B1', '\u00B2', '\u00B3', '\u00B4', '\u00B5', '\u00B6', '\u00B7', '\u00B8', '\u00B9', '\u00BA', '\u00BB', '\u00BC', '\u00BD', '\u00BE', '\u00BF',
+    '\u00C0', '\u00C1', '\u00C2', '\u00C3', '\u00C4', '\u00C5', '\u00C6', '\u00C7', '\u00C8', '\u00C9', '\u00CA', '\u00CB', '\u00CC', '\u00CD', '\u00CE', '\u00CF',
+    '\u00D0', '\u00D1', '\u00D2', '\u00D3', '\u00D4', '\u00D5', '\u00D6', '\u00D7', '\u00D8', '\u00D9', '\u00DA', '\u00DB', '\u00DC', '\u00DD', '\u00DE', '\u00DF',
+    '\u00E0', '\u00E1', '\u00E2', '\u00E3', '\u00E4', '\u00E5', '\u00E6', '\u00E7', '\u00E8', '\u00E9', '\u00EA', '\u00EB', '\u00EC', '\u00ED', '\u00EE', '\u00EF',
+    '\u00F0', '\u00F1', '\u00F2', '\u00F3', '\u00F4', '\u00F5', '\u00F6', '\u00F7', '\u00F8', '\u00F9', '\u00FA', '\u00FB', '\u00FC', '\u00FD', '\u00FE', '\u00FF'
   ];
 }

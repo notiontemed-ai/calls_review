@@ -31,7 +31,7 @@ const CONFIG = {
 
   RENAME_FILES_ON_DRIVE: true,
 
-  N8N_WEBHOOK_URL: 'https://n8n-x3.tech.temed.ru/webhook/mango-call-с-stereo-safe-v2',
+  N8N_WEBHOOK_URL: 'https://n8n-x3.tech.temed.ru/webhook/mango-call-transcribe-stereo-safe-v2',
 
   // Имя заголовка и токен. То же имя и значение — в Header Auth credential в n8n:
   N8N_SECRET_HEADER: 'X-TEMED-CALLS-SECRET',

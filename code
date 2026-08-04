@@ -25,6 +25,7 @@ const CONFIG = {
   SHEET_NAME: 'Записи звонков',
   LOG_SHEET_NAME: 'Лог',
   PROMPTS_SHEET_NAME: 'Промпты',
+  EMPLOYEES_SHEET_NAME: 'Сотрудники',
 
   MAX_FILES_PER_RUN: 500,
   MAX_SEND_PER_RUN: 50,
@@ -53,6 +54,15 @@ const HEADERS = [
   'mango_side',
   'line_name',
   'operator_name',
+
+  // Матчинг оператора по листу «Сотрудники» (заполняет скрипт при скане).
+  // operator_name_raw — то, что дал Mango; operator_name перезаписывается
+  // полным ФИО из справочника только при надёжном совпадении.
+  'operator_name_raw',
+  'operator_name_bitrix',
+  'operator_bitrix_user_id',
+  'operator_match_status',
+  'operator_match_comment',
 
   'drive_file_id',
   'drive_url',
@@ -87,6 +97,10 @@ const HEADERS = [
   'no_booking_detail',
   'is_primary_patient',
   'requested_specialist',
+  'requested_specialist_raw',
+  'requested_specialist_bitrix_user_id',
+  'requested_specialist_match_status',
+  'requested_specialist_match_comment',
   'is_appointment_booked',
   'appointment_specialist',
   'appointment_datetime',
@@ -128,6 +142,10 @@ const RESULT_HEADERS = [
   'no_booking_detail',
   'is_primary_patient',
   'requested_specialist',
+  'requested_specialist_raw',
+  'requested_specialist_bitrix_user_id',
+  'requested_specialist_match_status',
+  'requested_specialist_match_comment',
   'is_appointment_booked',
   'appointment_specialist',
   'appointment_datetime',
@@ -249,6 +267,12 @@ function onOpen() {
     .addSeparator()
     .addItem('Отправить в n8n', 'sendNewCallsToTranscriptionN8n')
     .addSeparator()
+    .addItem('Обновить сотрудников из Битрикс', 'refreshEmployeesFromBitrix')
+    .addItem(
+      'Создать ежедневный триггер обновления сотрудников',
+      'createEmployeesDailyRefreshTrigger'
+    )
+    .addSeparator()
     .addItem('Тест: пинг n8n', 'pingN8nWebhook')
     .addToUi();
 }
@@ -278,6 +302,12 @@ function scanMangoRecordingsFolder() {
 
     const headerMap = getHeaderMap_(sheet);
     const existingCallKeys = loadExistingCallKeys_(sheet, headerMap);
+
+    // Справочник сотрудников читается один раз за ран: матчинг ФИО
+    // оператора идёт по листу «Сотрудники», без обращений в Битрикс.
+    const employees = loadEmployeesFromSheet_(push);
+
+    push('EMPLOYEES', '', 'Справочник сотрудников: ' + employees.length + ' записей');
 
     const rootFolder = DriveApp.getFolderById(CONFIG.SOURCE_FOLDER_ID);
     push('FOLDER', '', 'ID: ' + CONFIG.SOURCE_FOLDER_ID + ', название: ' + rootFolder.getName());
@@ -380,6 +410,20 @@ function scanMangoRecordingsFolder() {
 
           const now = nowString_();
 
+          // Матчинг оператора по листу «Сотрудники». Подстановка полного ФИО
+          // разрешена только при надёжном совпадении; иначе в operator_name
+          // остаётся то, что дал Mango, а причина видна в *_match_*.
+          const operatorMatch = matchEmployeeByName_(parsed.operator_name, employees);
+          const operatorMatched = isConfidentEmployeeMatch_(operatorMatch.status);
+
+          push(
+            'EMPLOYEE_MATCH_OPERATOR',
+            filenameFixed,
+            'raw="' + parsed.operator_name + '", status=' + operatorMatch.status +
+              ', bitrix="' + operatorMatch.full_name + '", id=' + operatorMatch.bitrix_user_id +
+              (operatorMatch.comment ? ', comment=' + operatorMatch.comment : '')
+          );
+
           const rowObj = {
             call_key: callKey,
             filename_raw: filenameRaw,
@@ -393,7 +437,13 @@ function scanMangoRecordingsFolder() {
             client_phone: parsed.client_phone,
             mango_side: parsed.mango_side,
             line_name: parsed.line_name,
-            operator_name: parsed.operator_name,
+            operator_name: operatorMatched ? operatorMatch.full_name : parsed.operator_name,
+
+            operator_name_raw: parsed.operator_name,
+            operator_name_bitrix: operatorMatched ? operatorMatch.full_name : '',
+            operator_bitrix_user_id: operatorMatched ? operatorMatch.bitrix_user_id : '',
+            operator_match_status: operatorMatch.status,
+            operator_match_comment: operatorMatch.comment,
 
             drive_file_id: file.getId(),
             drive_url: file.getUrl(),
@@ -542,9 +592,18 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
         ', analysis_system_prompt: ' + (prompts.analysis_system_prompt ? 'задан' : 'по умолчанию из n8n')
     );
 
-    // Список сотрудников из Битрикс — в prompts, чтобы уехал в n8n
-    // вместе с остальными промптами. Ошибка Битрикс отправку не блокирует.
-    prompts.staff_list = loadBitrixStaffSafe_(push);
+    // Снимок справочника сотрудников для n8n: он матчит requested_specialist
+    // сам, поэтому получает employees в теле каждого запроса. Лист читается
+    // один раз за ран (кэш в EMPLOYEES_CACHE_), пустой справочник отправку
+    // не блокирует — предупреждение уже ушло в «Лог».
+    const employees = loadEmployeesFromSheet_(push);
+
+    push(
+      'EMPLOYEES',
+      '',
+      'Справочник сотрудников: ' + employees.length + ' записей, активных: ' +
+        employees.filter(function(employee) { return employee.active; }).length
+    );
 
     const sheet = getOrCreateSheet_();
     ensureHeaders_(sheet);
@@ -702,6 +761,10 @@ function sendTranscriptionRow_(sheet, rowNumber, row, headerMap, push) {
   // и закэшированы, поэтому лист «Промпты» читается один раз за запуск.
   const prompts = loadPrompts_();
 
+  // Снимок справочника для матчинга requested_specialist в n8n.
+  // Лист уже прочитан в начале отправки — здесь отдаётся кэш рана.
+  const employees = buildEmployeesPayload_(loadEmployeesFromSheet_(log));
+
   const payload = {
     action: 'transcribe_and_analyze_call',
 
@@ -726,8 +789,19 @@ function sendTranscriptionRow_(sheet, rowNumber, row, headerMap, push) {
     line_name: getCellByHeader_(row, headerMap, 'line_name'),
     operator_name: getCellByHeader_(row, headerMap, 'operator_name'),
 
+    // Результат матчинга оператора (его выполнил скан) — n8n использует его
+    // как есть и заново не считает.
+    operator_name_raw: getCellByHeader_(row, headerMap, 'operator_name_raw'),
+    operator_name_bitrix: getCellByHeader_(row, headerMap, 'operator_name_bitrix'),
+    operator_bitrix_user_id: getCellByHeader_(row, headerMap, 'operator_bitrix_user_id'),
+    operator_match_status: getCellByHeader_(row, headerMap, 'operator_match_status'),
+
     drive_file_id: getCellByHeader_(row, headerMap, 'drive_file_id'),
     drive_url: getCellByHeader_(row, headerMap, 'drive_url'),
+
+    // Справочник сотрудников для матчинга requested_specialist в n8n.
+    // AI список НЕ получает: сопоставление идёт кодом по этому снимку.
+    employees: employees,
 
     // Результат n8n пишет в таблицу сам, поэтому callback не передаётся.
     prompts: prompts
@@ -1423,43 +1497,161 @@ function createDefaultPromptsSheet_() {
 
 
 /************************************************************
- * СОТРУДНИКИ ИЗ БИТРИКС24
+ * СПРАВОЧНИК СОТРУДНИКОВ (ЛИСТ «Сотрудники»)
+ *
+ * Единственный источник истины по сотрудникам — лист «Сотрудники»
+ * в этой же таблице. Битрикс используется ТОЛЬКО для обновления листа
+ * (пункт меню или ночной триггер); в момент матчинга в Битрикс не ходим.
+ *
+ * Кто чем пользуется:
+ *   • ФИО оператора матчит скан (scanMangoRecordingsFolder) по этому листу;
+ *   • requested_specialist матчит n8n — снимок листа уезжает в payload
+ *     как employees, потому что результат n8n пишет в таблицу напрямую.
+ *
+ * AI список сотрудников НЕ получает и ФИО не сопоставляет: свободная
+ * генерация модели не источник истины для фамилий.
+ ************************************************************/
+
+const EMPLOYEES_HEADERS = [
+  'bitrix_user_id',
+  'active',
+  'last_name',
+  'name',
+  'second_name',
+  'full_name',
+  'full_name_normalized',
+  'short_name',
+  'short_name_normalized',
+  'last_name_normalized',
+  'work_position',
+  'department_ids',
+  'updated_at'
+];
+
+// Защита от бесконечного цикла пагинации user.get.
+const BITRIX_USER_PAGES_LIMIT = 40;
+
+// Сколько ждём scriptLock: ручной запуск и ночной триггер не должны
+// писать лист одновременно.
+const EMPLOYEES_LOCK_TIMEOUT_MS = 30000;
+
+const EMPLOYEES_TRIGGER_HANDLER = 'refreshEmployeesFromBitrix';
+
+// Кэш на время одного выполнения скрипта: лист читается один раз.
+let EMPLOYEES_CACHE_ = null;
+
+/************************************************************
+ * ОБНОВЛЕНИЕ ЛИСТА ИЗ БИТРИКС24
  *
  * Свойство скрипта BITRIX_WEBHOOK_BASE_URL — базовый URL входящего
  * вебхука Битрикс24 вида:
  *   https://portal.bitrix24.ru/rest/USER_ID/TOKEN
- * Скрипт вызывает {BASE}/user.get.json (только активные пользователи)
- * и передаёт список в payload как prompts.staff_list:
- *   [{ name: 'Фамилия Имя Отчество', position: 'Должность' }, ...]
- *
- * Список кэшируется на 6 часов. Недоступность Битрикс НЕ блокирует
- * отправку: в этом случае staff_list пустой, а в лог пишется WARN.
+ * Вызывается {BASE}/user.get.json БЕЗ фильтра по ACTIVE: на листе нужны
+ * и активные, и уволенные (звонки в архиве старше увольнения).
  ************************************************************/
 
-const BITRIX_STAFF_CACHE_KEY = 'bitrix_staff_v1';
-const BITRIX_STAFF_CACHE_SECONDS = 21600; // 6 часов — максимум CacheService
+/**
+ * Полностью перезаписывает лист «Сотрудники» снимком из Битрикс.
+ * Работает и из меню, и из триггера: UI-вызовы обёрнуты в try/catch.
+ */
+function refreshEmployeesFromBitrix() {
+  const runId = 'employees-' + Date.now();
+  const log = [];
 
-function loadBitrixStaff_() {
+  const push = function(step, file, details) {
+    log.push([
+      nowString_(),
+      runId,
+      String(step || ''),
+      String(file || '').slice(0, 300),
+      String(details || '').slice(0, 2000)
+    ]);
+  };
+
+  const lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(EMPLOYEES_LOCK_TIMEOUT_MS)) {
+    push(
+      'EMPLOYEES_REFRESH_LOCKED',
+      '',
+      'Обновление уже выполняется (lock не получен за ' +
+        EMPLOYEES_LOCK_TIMEOUT_MS + ' мс). Запуск пропущен.'
+    );
+
+    flushLog_(log);
+    showToast_('Обновление сотрудников уже выполняется — запуск пропущен.');
+    return;
+  }
+
+  try {
+    push('EMPLOYEES_REFRESH_START', '', 'Загрузка сотрудников из Битрикс (user.get, все статусы)');
+
+    const users = fetchBitrixUsers_(push);
+    const updatedAt = nowString_();
+
+    const rows = [];
+    let activeCount = 0;
+    let skippedNoName = 0;
+
+    users.forEach(function(user) {
+      const employee = buildEmployeeFromBitrixUser_(user, updatedAt);
+
+      // Пользователь без ФИО матчингу бесполезен и занимает пустую строку.
+      if (!employee.full_name) {
+        skippedNoName++;
+        return;
+      }
+
+      if (employee.active) activeCount++;
+
+      rows.push(EMPLOYEES_HEADERS.map(function(header) {
+        return employee[header];
+      }));
+    });
+
+    push('EMPLOYEES_REFRESH_WRITE', '', 'Запись снимка на лист «' + CONFIG.EMPLOYEES_SHEET_NAME + '»: ' + rows.length + ' строк');
+
+    writeEmployeesSheet_(rows);
+
+    // Снимок изменился — кэш рана больше не актуален.
+    EMPLOYEES_CACHE_ = null;
+
+    const message = 'Обновлено сотрудников: ' + rows.length + ', активных: ' + activeCount +
+      (skippedNoName ? ', пропущено без ФИО: ' + skippedNoName : '');
+
+    push('EMPLOYEES_REFRESH_FINISH', '', message);
+    showToast_('Сотрудники обновлены: ' + rows.length + ', активных: ' + activeCount);
+
+  } catch (e) {
+    push('EMPLOYEES_REFRESH_ERROR', '', String((e && e.stack) || e));
+    showToast_('Ошибка обновления сотрудников: ' + String((e && e.message) || e));
+    throw e;
+  } finally {
+    lock.releaseLock();
+    flushLog_(log);
+  }
+}
+
+/**
+ * Все пользователи Битрикс постранично. Фильтра по ACTIVE нет намеренно:
+ * уволенные тоже нужны, их активность видна в колонке active.
+ */
+function fetchBitrixUsers_(push) {
   const base = PropertiesService.getScriptProperties().getProperty('BITRIX_WEBHOOK_BASE_URL');
 
   if (!base) {
     throw new Error(
-      'Свойство скрипта BITRIX_WEBHOOK_BASE_URL не задано ' +
-      '(Настройки проекта → Свойства скрипта).'
+      'Не задано свойство скрипта BITRIX_WEBHOOK_BASE_URL.\n' +
+      'Укажите базовый webhook Битрикс в Project Settings → Script properties.'
     );
   }
 
-  const cache = CacheService.getScriptCache();
-  const cached = cache.get(BITRIX_STAFF_CACHE_KEY);
-
-  if (cached) return JSON.parse(cached);
-
   const baseUrl = String(base).replace(/\/+$/, '');
-  const staff = [];
+  const users = [];
   let start = 0;
 
-  for (let page = 0; page < 40; page++) {
-    const url = baseUrl + '/user.get.json?ACTIVE=true&start=' + start;
+  for (let page = 0; page < BITRIX_USER_PAGES_LIMIT; page++) {
+    const url = baseUrl + '/user.get.json?start=' + start;
     const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
     const code = response.getResponseCode();
 
@@ -1476,55 +1668,546 @@ function loadBitrixStaff_() {
       throw new Error('Bitrix user.get: ' + data.error + ' — ' + (data.error_description || ''));
     }
 
-    (data.result || []).forEach(function(user) {
-      const name = [user.LAST_NAME, user.NAME, user.SECOND_NAME]
-        .map(function(part) { return String(part || '').trim(); })
-        .filter(Boolean)
-        .join(' ');
+    const batch = data.result || [];
 
-      if (!name) return;
-
-      staff.push({
-        name: name,
-        position: String(user.WORK_POSITION || '').trim()
-      });
+    batch.forEach(function(user) {
+      users.push(user);
     });
+
+    push(
+      'EMPLOYEES_REFRESH_PAGE',
+      '',
+      'страница ' + (page + 1) + ', получено ' + batch.length + ', всего ' + users.length
+    );
 
     if (data.next === undefined || data.next === null) break;
 
     start = data.next;
   }
 
-  const serialized = JSON.stringify(staff);
-
-  // Лимит CacheService — 100 КБ на ключ; слишком большой список не кэшируем.
-  if (serialized.length < 90000) {
-    cache.put(BITRIX_STAFF_CACHE_KEY, serialized, BITRIX_STAFF_CACHE_SECONDS);
-  }
-
-  return staff;
+  return users;
 }
 
 /**
- * Безопасная обёртка: ошибка Битрикс не отменяет отправку.
+ * Пользователь Битрикс → строка листа «Сотрудники».
+ * Нормализованные формы считаются здесь и хранятся на листе: потребители
+ * (скан и n8n) читают готовые значения и сами ничего не нормализуют.
  */
-function loadBitrixStaffSafe_(push) {
-  try {
-    const staff = loadBitrixStaff_();
+function buildEmployeeFromBitrixUser_(user, updatedAt) {
+  const lastName = String((user && user.LAST_NAME) || '').trim();
+  const firstName = String((user && user.NAME) || '').trim();
+  const secondName = String((user && user.SECOND_NAME) || '').trim();
 
-    push('BITRIX_STAFF', '', 'Сотрудники из Битрикс загружены: ' + staff.length + ' чел.');
+  const fullName = [lastName, firstName, secondName].filter(Boolean).join(' ');
 
-    return staff;
-  } catch (e) {
-    push(
-      'BITRIX_STAFF_WARN',
-      '',
-      'Сотрудники из Битрикс НЕ загружены (' + String((e && e.message) || e) +
-        '). Отправка продолжается без списка сотрудников: ' +
-        'appointment_specialist будет определяться только из речи.'
+  // «Фамилия И» или «Фамилия И О» — так оператора пишет Mango.
+  const initials = [firstName, secondName]
+    .filter(Boolean)
+    .map(function(part) { return part.charAt(0); })
+    .join(' ');
+
+  const shortName = lastName && initials ? lastName + ' ' + initials : lastName;
+
+  const departments = user && user.UF_DEPARTMENT;
+
+  return {
+    bitrix_user_id: String((user && user.ID) || '').trim(),
+    active: parseEmployeeBoolean_(user && user.ACTIVE) ? 'TRUE' : 'FALSE',
+    last_name: lastName,
+    name: firstName,
+    second_name: secondName,
+    full_name: fullName,
+    full_name_normalized: normalizeFio_(fullName),
+    short_name: shortName,
+    short_name_normalized: normalizeFio_(shortName),
+    last_name_normalized: normalizeFio_(lastName),
+    work_position: String((user && user.WORK_POSITION) || '').trim(),
+    department_ids: Array.isArray(departments)
+      ? departments.join(',')
+      : String(departments === null || departments === undefined ? '' : departments).trim(),
+    updated_at: updatedAt
+  };
+}
+
+/**
+ * Полная перезапись листа: старые строки очищаются, снимок пишется
+ * одним setValues. Дублей по bitrix_user_id нет по построению —
+ * лист всегда содержит ровно один снимок.
+ */
+function writeEmployeesSheet_(rows) {
+  const sheet = getOrCreateEmployeesSheet_();
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow > 1) {
+    sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).clearContent();
+  }
+
+  if (rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, EMPLOYEES_HEADERS.length).setValues(rows);
+  }
+}
+
+function getOrCreateEmployeesSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sheet = ss.getSheetByName(CONFIG.EMPLOYEES_SHEET_NAME);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(CONFIG.EMPLOYEES_SHEET_NAME);
+  }
+
+  ensureSheetHeaders_(sheet, EMPLOYEES_HEADERS);
+
+  return sheet;
+}
+
+/************************************************************
+ * ЕЖЕДНЕВНЫЙ ТРИГГЕР ОБНОВЛЕНИЯ
+ ************************************************************/
+
+/**
+ * Пересоздаёт ежедневный триггер обновления сотрудников.
+ * Старые триггеры удаляются, поэтому повторный запуск их не плодит.
+ */
+function createEmployeesDailyRefreshTrigger() {
+  const removed = deleteEmployeesDailyRefreshTriggers_();
+
+  ScriptApp.newTrigger(EMPLOYEES_TRIGGER_HANDLER)
+    .timeBased()
+    .everyDays(1)
+    .atHour(0)
+    .nearMinute(1)
+    .create();
+
+  flushLog_([[
+    nowString_(),
+    'employees-trigger-' + Date.now(),
+    'EMPLOYEES_TRIGGER_CREATED',
+    '',
+    'Создан ежедневный триггер ' + EMPLOYEES_TRIGGER_HANDLER +
+      ' (около 00:01). Удалено старых триггеров: ' + removed
+  ]]);
+
+  // «Около» — не оговорка: Apps Script запускает триггер в пределах часа.
+  showToast_('Ежедневный триггер обновления сотрудников создан: около 00:01');
+}
+
+/**
+ * Удаляет все триггеры обновления сотрудников. Возвращает их количество.
+ */
+function deleteEmployeesDailyRefreshTriggers_() {
+  const triggers = ScriptApp.getProjectTriggers();
+  let removed = 0;
+
+  triggers.forEach(function(trigger) {
+    if (trigger.getHandlerFunction() === EMPLOYEES_TRIGGER_HANDLER) {
+      ScriptApp.deleteTrigger(trigger);
+      removed++;
+    }
+  });
+
+  return removed;
+}
+
+/************************************************************
+ * ЧТЕНИЕ СПРАВОЧНИКА
+ ************************************************************/
+
+/**
+ * Лист «Сотрудники» → массив объектов по его колонкам.
+ * Читается один раз за выполнение (кэш EMPLOYEES_CACHE_).
+ *
+ * Нет листа или он пуст — возвращаем [] и пишем EMPLOYEES_SHEET_EMPTY
+ * в «Лог». Ни скан, ни отправка при этом не падают: матчинг вернёт
+ * NOT_FOUND с комментарием «Справочник сотрудников пуст».
+ */
+function loadEmployeesFromSheet_(push) {
+  if (EMPLOYEES_CACHE_) return EMPLOYEES_CACHE_;
+
+  const sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.EMPLOYEES_SHEET_NAME);
+
+  if (!sheet) {
+    logEmployeesEvent_(
+      push,
+      'EMPLOYEES_SHEET_EMPTY',
+      'Лист «' + CONFIG.EMPLOYEES_SHEET_NAME + '» не найден. ' +
+        'Запустите «Обновить сотрудников из Битрикс».'
     );
 
-    return [];
+    EMPLOYEES_CACHE_ = [];
+    return EMPLOYEES_CACHE_;
+  }
+
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+
+  if (lastRow < 2 || lastColumn < 1) {
+    logEmployeesEvent_(
+      push,
+      'EMPLOYEES_SHEET_EMPTY',
+      'Лист «' + CONFIG.EMPLOYEES_SHEET_NAME + '» пуст. ' +
+        'Запустите «Обновить сотрудников из Битрикс».'
+    );
+
+    EMPLOYEES_CACHE_ = [];
+    return EMPLOYEES_CACHE_;
+  }
+
+  const headerMap = getHeaderMap_(sheet);
+  const values = sheet.getRange(2, 1, lastRow - 1, lastColumn).getValues();
+  const employees = [];
+
+  values.forEach(function(row) {
+    const employee = {};
+
+    EMPLOYEES_HEADERS.forEach(function(header) {
+      const column = headerMap[header];
+      const value = column ? row[column - 1] : '';
+
+      employee[header] = String(value === null || value === undefined ? '' : value).trim();
+    });
+
+    if (!employee.full_name && !employee.last_name) return;
+
+    employee.active = parseEmployeeBoolean_(
+      headerMap.active ? row[headerMap.active - 1] : ''
+    );
+
+    // Подстраховка для листа, записанного старой версией скрипта:
+    // потребители всегда получают готовые нормализованные формы.
+    if (!employee.full_name_normalized) {
+      employee.full_name_normalized = normalizeFio_(employee.full_name);
+    }
+
+    if (!employee.short_name_normalized) {
+      employee.short_name_normalized = normalizeFio_(employee.short_name);
+    }
+
+    if (!employee.last_name_normalized) {
+      employee.last_name_normalized = normalizeFio_(employee.last_name);
+    }
+
+    employees.push(employee);
+  });
+
+  if (employees.length === 0) {
+    logEmployeesEvent_(
+      push,
+      'EMPLOYEES_SHEET_EMPTY',
+      'Лист «' + CONFIG.EMPLOYEES_SHEET_NAME + '» не содержит ни одного сотрудника.'
+    );
+  }
+
+  EMPLOYEES_CACHE_ = employees;
+
+  return EMPLOYEES_CACHE_;
+}
+
+/**
+ * Снимок справочника для payload в n8n — только поля, нужные матчингу.
+ * Остальные колонки листа в тело запроса не уезжают.
+ */
+function buildEmployeesPayload_(employees) {
+  return (employees || []).map(function(employee) {
+    return {
+      bitrix_user_id: employee.bitrix_user_id,
+      active: !!employee.active,
+      full_name: employee.full_name,
+      full_name_normalized: employee.full_name_normalized,
+      short_name_normalized: employee.short_name_normalized,
+      last_name_normalized: employee.last_name_normalized,
+      work_position: employee.work_position
+    };
+  });
+}
+
+/**
+ * Событие справочника в «Лог». push есть у скана и отправки; без него
+ * (например, при вызове из редактора) пишем строку в лист напрямую.
+ */
+function logEmployeesEvent_(push, step, details) {
+  if (typeof push === 'function') {
+    push(step, '', details);
+    return;
+  }
+
+  flushLog_([[nowString_(), 'employees-' + Date.now(), step, '', String(details || '')]]);
+}
+
+/**
+ * ACTIVE из Битрикс приходит как boolean, 'Y'/'N' или строкой;
+ * с листа — как чекбокс или текст TRUE/FALSE.
+ */
+function parseEmployeeBoolean_(value) {
+  if (value === true) return true;
+  if (value === false) return false;
+
+  const s = String(value === null || value === undefined ? '' : value).trim().toLowerCase();
+
+  return ['true', 'y', 'yes', '1', 'да', 'истина'].indexOf(s) !== -1;
+}
+
+/************************************************************
+ * МАТЧИНГ ФИО ПО СПРАВОЧНИКУ
+ *
+ * ВНИМАНИЕ: JS-копия этого алгоритма (normalizeFio_ + matchEmployeeByName_)
+ * живёт в n8n.json, нода «Prepare Sheet Update» — она матчит
+ * requested_specialist. Менять обе реализации нужно синхронно.
+ *
+ * Никакого fuzzy-матчинга: неуверенное совпадение — это NOT_FOUND,
+ * а не подстановка похожего сотрудника.
+ ************************************************************/
+
+/**
+ * Нормализация ФИО:
+ *   нижний регистр; ё → е; служебные символы (точки, запятые, кавычки)
+ *   → пробел; несколько пробелов → один; trim.
+ *
+ *   Кузнецов Максим Николаевич → кузнецов максим николаевич
+ *   Кузнецов М. Н.            → кузнецов м н
+ *   Кузнецов МН               → кузнецов мн
+ */
+function normalizeFio_(text) {
+  return String(text === null || text === undefined ? '' : text)
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/[^0-9a-zа-я]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Ключ короткой формы: фамилия + слитные инициалы.
+ *   «солопова о с» → { last: 'солопова', initials: 'ос' }
+ *   «кузнецов мн»  → { last: 'кузнецов', initials: 'мн' }
+ *   «кузнецов максим николаевич» → null (это не короткая форма)
+ *
+ * Инициалы склеиваются, поэтому «Кузнецов М. Н.» и «Кузнецов МН» дают
+ * один и тот же ключ.
+ */
+function fioShortKey_(normalized) {
+  const tokens = String(normalized || '').split(' ').filter(Boolean);
+
+  if (tokens.length < 2) return null;
+
+  const rest = tokens.slice(1);
+
+  // Инициал — токен из одной буквы либо один слитный блок из двух.
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i].length > 2) return null;
+  }
+
+  const initials = rest.join('');
+
+  // У человека максимум два инициала: имя и отчество.
+  if (!initials || initials.length > 2) return null;
+
+  return { last: tokens[0], initials: initials };
+}
+
+/**
+ * Совпадение коротких форм. Mango часто даёт только первый инициал
+ * («Солопова О»), а в справочнике их два («Солопова О С»), поэтому
+ * более короткий набор инициалов должен быть началом более длинного.
+ * Неоднозначность этим не маскируется: несколько подошедших сотрудников
+ * дают AMBIGUOUS и автоподстановки не будет.
+ *
+ * useBase — сравнивать фамилии в базовой (беспадежной) форме.
+ */
+function matchesFioShortForm_(inputKey, employeeShortNormalized, useBase) {
+  if (!inputKey) return false;
+
+  const employeeKey = fioShortKey_(employeeShortNormalized);
+
+  if (!employeeKey) return false;
+
+  const employeeLast = useBase ? stripFioCaseEnding_(employeeKey.last) : employeeKey.last;
+
+  if (inputKey.last !== employeeLast) return false;
+
+  return inputKey.initials.indexOf(employeeKey.initials) === 0 ||
+    employeeKey.initials.indexOf(inputKey.initials) === 0;
+}
+
+// Частые падежные окончания фамилий. Длинные — раньше коротких.
+const FIO_CASE_ENDINGS = ['ому', 'ему', 'ым', 'им', 'ой', 'ей', 'а', 'у', 'ю'];
+
+/**
+ * Базовая форма фамилии: отсекает падежное окончание.
+ * Основа короче трёх букв не признаётся — «Ким», «Цой» остаются как есть.
+ */
+function stripFioCaseEnding_(token) {
+  const s = String(token || '');
+
+  for (let i = 0; i < FIO_CASE_ENDINGS.length; i++) {
+    const ending = FIO_CASE_ENDINGS[i];
+
+    if (s.length - ending.length >= 3 && s.slice(-ending.length) === ending) {
+      return s.slice(0, s.length - ending.length);
+    }
+  }
+
+  return s;
+}
+
+/**
+ * Базовая форма всей строки: падежное окончание снимается с первого
+ * токена (фамилии), остальные части остаются как есть.
+ */
+function baseFioForm_(normalized) {
+  const tokens = String(normalized || '').split(' ').filter(Boolean);
+
+  if (tokens.length === 0) return '';
+
+  tokens[0] = stripFioCaseEnding_(tokens[0]);
+
+  return tokens.join(' ');
+}
+
+/**
+ * Сопоставление имени со справочником.
+ *
+ * Возвращает { status, bitrix_user_id, full_name, comment }, где status —
+ * EXACT | SHORT_EXACT | LASTNAME_UNIQUE | NOT_FOUND | AMBIGUOUS | EMPTY.
+ *
+ * Порядок правил (первое сработавшее останавливает поиск):
+ *   1. пустое имя → EMPTY;
+ *   2. полное ФИО → EXACT;
+ *   3. короткая форма «Фамилия И О», в т.ч. со слитными инициалами → SHORT_EXACT;
+ *   4. одна фамилия → LASTNAME_UNIQUE;
+ *   5. падежная форма фамилии, только при единственном кандидате → LASTNAME_UNIQUE;
+ *   6. иначе → NOT_FOUND.
+ *
+ * Несколько кандидатов на любом шаге — AMBIGUOUS, автоподстановки нет.
+ * options.activeOnly (по умолчанию true) — матчить только active = TRUE.
+ */
+function matchEmployeeByName_(name, employees, options) {
+  const activeOnly = !(options && options.activeOnly === false);
+
+  const result = {
+    status: 'EMPTY',
+    bitrix_user_id: '',
+    full_name: '',
+    comment: ''
+  };
+
+  const raw = String(name === null || name === undefined ? '' : name).trim();
+  const normalized = normalizeFio_(raw);
+
+  if (!normalized) {
+    result.comment = 'Имя не указано';
+    return result;
+  }
+
+  const list = (employees || []).filter(function(employee) {
+    return activeOnly ? !!employee.active : true;
+  });
+
+  if (list.length === 0) {
+    result.status = 'NOT_FOUND';
+    result.comment = 'Справочник сотрудников пуст';
+    return result;
+  }
+
+  const shortKey = fioShortKey_(normalized);
+
+  const steps = [
+    {
+      status: 'EXACT',
+      test: function(employee) {
+        return employee.full_name_normalized === normalized;
+      }
+    },
+    {
+      status: 'SHORT_EXACT',
+      test: function(employee) {
+        return employee.short_name_normalized === normalized ||
+          matchesFioShortForm_(shortKey, employee.short_name_normalized, false);
+      }
+    },
+    {
+      status: 'LASTNAME_UNIQUE',
+      test: function(employee) {
+        return employee.last_name_normalized === normalized;
+      }
+    }
+  ];
+
+  for (let i = 0; i < steps.length; i++) {
+    const found = list.filter(steps[i].test);
+
+    if (found.length === 1) {
+      result.status = steps[i].status;
+      result.bitrix_user_id = found[0].bitrix_user_id;
+      result.full_name = found[0].full_name;
+      return result;
+    }
+
+    if (found.length > 1) {
+      result.status = 'AMBIGUOUS';
+      result.comment = describeEmployeeCandidates_(found);
+      return result;
+    }
+  }
+
+  // Падежные формы: «Коныховой», «Кузнецову». Статус не поднимается выше
+  // LASTNAME_UNIQUE и допускается только при единственном кандидате.
+  const base = baseFioForm_(normalized);
+  const baseKey = fioShortKey_(base);
+
+  const byCase = list.filter(function(employee) {
+    return baseFioForm_(employee.full_name_normalized) === base ||
+      baseFioForm_(employee.short_name_normalized) === base ||
+      matchesFioShortForm_(baseKey, employee.short_name_normalized, true) ||
+      stripFioCaseEnding_(employee.last_name_normalized) === base;
+  });
+
+  if (byCase.length === 1) {
+    result.status = 'LASTNAME_UNIQUE';
+    result.bitrix_user_id = byCase[0].bitrix_user_id;
+    result.full_name = byCase[0].full_name;
+    result.comment = 'падежная форма: ' + raw + ' → ' + base;
+    return result;
+  }
+
+  if (byCase.length > 1) {
+    result.status = 'AMBIGUOUS';
+    result.comment = describeEmployeeCandidates_(byCase);
+    return result;
+  }
+
+  result.status = 'NOT_FOUND';
+  result.comment = 'Не найдено надежное совпадение в справочнике сотрудников';
+
+  return result;
+}
+
+/**
+ * Автоподстановка ФИО разрешена только при этих статусах.
+ */
+function isConfidentEmployeeMatch_(status) {
+  return ['EXACT', 'SHORT_EXACT', 'LASTNAME_UNIQUE'].indexOf(String(status || '')) !== -1;
+}
+
+/**
+ * «Найдено несколько сотрудников: Иванова Анна (12), Иванова Алла (57)»
+ */
+function describeEmployeeCandidates_(candidates) {
+  return 'Найдено несколько сотрудников: ' + candidates
+    .slice(0, 10)
+    .map(function(employee) {
+      return employee.full_name + ' (' + employee.bitrix_user_id + ')';
+    })
+    .join(', ');
+}
+
+/**
+ * Toast без падения в триггерном контексте, где UI недоступен.
+ */
+function showToast_(message) {
+  try {
+    SpreadsheetApp.getActive().toast(String(message || ''));
+  } catch (e) {
+    Logger.log(message);
   }
 }
 

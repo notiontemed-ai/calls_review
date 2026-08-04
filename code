@@ -115,6 +115,8 @@ function onOpen() {
     .addItem('Отправить в n8n — 100 записей', 'sendNewCallsToTranscriptionN8n100')
     .addSeparator()
     .addItem('Отправить в n8n', 'sendNewCallsToTranscriptionN8n')
+    .addSeparator()
+    .addItem('Тест: пинг n8n', 'pingN8nWebhook')
     .addToUi();
 }
 /************************************************************
@@ -341,7 +343,9 @@ function sendNewCallsToTranscriptionN8n100() {
 
 function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
   const sendLimit = normalizeSendLimit_(maxToSend);
+  const limitText = sendLimit === null ? '∞ (все подходящие записи)' : String(sendLimit);
   const runId = 'send-' + Date.now();
+  const runStartedAt = Date.now();
 
   // Пишем лог сразу, построчно: если скрипт зависнет или будет
   // убит по таймауту, уже записанные шаги останутся на листе «Лог».
@@ -367,7 +371,13 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
       'START',
       '',
       'Запуск отправки в n8n. URL: ' + String(CONFIG.N8N_WEBHOOK_URL) +
-        ', лимит: ' + (sendLimit === null ? 'все подходящие записи' : sendLimit)
+        ', лимит запуска: ' + limitText
+    );
+
+    push(
+      'SECRET',
+      '',
+      'Заголовок: ' + CONFIG.N8N_SECRET_HEADER + ', значение: ' + maskSecret_(CONFIG.N8N_SECRET)
     );
 
     getWebhookUrl_();
@@ -381,14 +391,39 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
     push('SHEET', '', 'Лист: ' + CONFIG.SHEET_NAME + ', строк с данными: ' + Math.max(0, lastRow - 1));
 
     if (lastRow < 2) {
-      push('FINISH', '', 'Нет строк для отправки.');
+      const emptyMessage = 'НЕТ СТРОК ДЛЯ ОТПРАВКИ. На листе «' + CONFIG.SHEET_NAME +
+        '» нет ни одной строки с данными. Запустите «Обновить список записей».';
+
+      push('NO_CANDIDATES', '', emptyMessage);
+      push('FINISH', '', emptyMessage);
       SpreadsheetApp.getActive().toast('Нет строк для отправки.');
+      showAlert_('Отправка в n8n', emptyMessage);
       return;
     }
 
     const values = sheet
       .getRange(2, 1, lastRow - 1, sheet.getLastColumn())
       .getValues();
+
+    const stats = analyzeSendCandidates_(values, headerMap);
+
+    push(
+      'CANDIDATES',
+      '',
+      'Всего строк с данными: ' + stats.totalRows +
+        ', кандидатов на отправку (проходят фильтр «ещё не отправлено»): ' + stats.candidates +
+        ', лимит запуска: ' + limitText
+    );
+
+    if (stats.candidates === 0) {
+      const noCandidatesMessage = describeNoCandidates_(stats);
+
+      push('NO_CANDIDATES', '', noCandidatesMessage);
+      push('FINISH', '', noCandidatesMessage + ' Время: ' + (Date.now() - runStartedAt) + ' мс.');
+      SpreadsheetApp.getActive().toast('Нет строк для отправки.');
+      showAlert_('Отправка в n8n', noCandidatesMessage);
+      return;
+    }
 
     let sent = 0;
     let skipped = 0;
@@ -405,20 +440,11 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
       const row = values[i];
       const callKey = getCellByHeader_(row, headerMap, 'call_key');
 
-      const driveFileId = getCellByHeader_(row, headerMap, 'drive_file_id');
-      const parseError = getCellByHeader_(row, headerMap, 'error_text');
-      const sendStatus = getCellByHeader_(row, headerMap, 'transcription_send_status');
-      const receivedAt = getCellByHeader_(row, headerMap, 'transcription_received_at');
       const transcriptionError = getCellByHeader_(row, headerMap, 'transcription_error');
 
-      let skipReason = '';
-
-      if (!driveFileId) skipReason = 'нет drive_file_id';
-      else if (parseError) skipReason = 'есть error_text: ' + parseError;
-      else if (sendStatus === 'SENT') skipReason = 'уже отправлено (transcription_send_status = SENT)';
-      else if (receivedAt) skipReason = 'уже есть результат (transcription_received_at заполнено)';
       // Строки со статусом ERROR НЕ пропускаются — повторяем отправку,
       // старая ошибка в transcription_error затирается при успехе.
+      const skipReason = getSendSkipReason_(row, headerMap);
 
       if (skipReason) {
         skipped++;
@@ -432,7 +458,7 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
 
       try {
         push('ROW_SEND', callKey, 'Строка ' + rowNumber + ': отправка...');
-        const info = sendTranscriptionRow_(sheet, rowNumber, row, headerMap);
+        const info = sendTranscriptionRow_(sheet, rowNumber, row, headerMap, push);
         sent++;
         push('ROW_OK', callKey, 'Строка ' + rowNumber + ': n8n принял. Ответ: ' + info);
       } catch (error) {
@@ -453,15 +479,19 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
       }
     }
 
+    const durationMs = Date.now() - runStartedAt;
+
     const message =
       'Отправлено: ' + sent +
-      ', пропущено: ' + skipped +
       ', ошибок: ' + errors +
-      ', лимит: ' + (sendLimit === null ? 'все' : sendLimit) +
+      ', пропущено: ' + skipped +
+      ', время: ' + durationMs + ' мс' +
+      ', лимит: ' + limitText +
       (aborted ? ' (прервано: n8n недоступен)' : '');
 
     push('FINISH', '', message);
     SpreadsheetApp.getActive().toast(message);
+    showAlert_('Отправка в n8n', message);
 
   } catch (e) {
     push('FATAL', '', String((e && e.stack) || e));
@@ -482,8 +512,11 @@ function normalizeSendLimit_(limit) {
 
   return Math.floor(n);
 }
-function sendTranscriptionRow_(sheet, rowNumber, row, headerMap) {
+function sendTranscriptionRow_(sheet, rowNumber, row, headerMap, push) {
   const webhookUrl = getWebhookUrl_();
+
+  // Логгер необязателен: функция работает и без диагностики.
+  const log = typeof push === 'function' ? push : function() {};
 
   const direction = getCellByHeader_(row, headerMap, 'direction');
   const initiator =
@@ -534,27 +567,39 @@ function sendTranscriptionRow_(sheet, rowNumber, row, headerMap) {
     drive_url: getCellByHeader_(row, headerMap, 'drive_url')
   };
 
-  if (!payload.call_key) {
-    throw new Error('В строке нет call_key');
+  const missing =
+    !payload.call_key ? 'В строке нет call_key'
+      : !payload.drive_file_id ? 'В строке нет drive_file_id'
+        : !payload.direction ? 'Не определено направление звонка'
+          : '';
+
+  if (missing) {
+    log('ERROR', payload.call_key, 'Строка ' + rowNumber + ': запрос не отправлен. ' + missing);
+    throw new Error(missing);
   }
 
-  if (!payload.drive_file_id) {
-    throw new Error('В строке нет drive_file_id');
-  }
-
-  if (!payload.direction) {
-    throw new Error('Не определено направление звонка');
-  }
+  const body = JSON.stringify(payload);
 
   const options = {
     method: 'post',
     contentType: 'application/json',
-    payload: JSON.stringify(payload),
+    payload: body,
     muteHttpExceptions: true,
     headers: {}
   };
 
   options.headers[CONFIG.N8N_SECRET_HEADER] = CONFIG.N8N_SECRET;
+
+  // Сам payload в лог не пишем: в нём телефоны. Достаточно call_key и размера.
+  log(
+    'REQUEST',
+    payload.call_key,
+    'Строка ' + rowNumber + ': POST ' + webhookUrl +
+      ', payload: ' + payloadSizeBytes_(body) + ' байт' +
+      ', заголовок ' + CONFIG.N8N_SECRET_HEADER + ': ' + maskSecret_(CONFIG.N8N_SECRET)
+  );
+
+  const startedAt = Date.now();
 
   let response;
 
@@ -562,11 +607,28 @@ function sendTranscriptionRow_(sheet, rowNumber, row, headerMap) {
     response = UrlFetchApp.fetch(webhookUrl, options);
   } catch (e) {
     // Сюда попадают DNS/connect/timeout — сервер вообще не ответил.
+    log(
+      'ERROR',
+      payload.call_key,
+      'Строка ' + rowNumber + ': СЕТЬ: сервер не ответил за ' + (Date.now() - startedAt) +
+        ' мс (DNS / timeout / connect). Текст ошибки: ' + String((e && e.stack) || e)
+    );
+
     throw new Error('СЕТЬ: ' + String(e.message || e));
   }
 
+  const durationMs = Date.now() - startedAt;
   const statusCode = response.getResponseCode();
   const responseText = response.getContentText();
+  const hint = httpStatusHint_(statusCode);
+
+  log(
+    'RESPONSE',
+    payload.call_key,
+    'Строка ' + rowNumber + ': HTTP ' + statusCode + ', ' + durationMs + ' мс' +
+      ', ответ: ' + shortResponseText_(responseText) +
+      (hint ? '. ' + hint : '')
+  );
 
   if (statusCode < 200 || statusCode >= 300) {
     throw new Error('n8n вернул HTTP ' + statusCode + ': ' + responseText);
@@ -594,6 +656,262 @@ function getWebhookUrl_() {
   }
 
   return url;
+}
+
+/************************************************************
+ * ДИАГНОСТИКА ОТПРАВКИ В N8N
+ *
+ * Задача блока — по листу «Лог» однозначно различать четыре
+ * сценария «в n8n нет executions»:
+ *   1) нет строк-кандидатов — запрос вообще не отправлялся;
+ *   2) сеть недоступна — UrlFetchApp бросил исключение;
+ *   3) n8n ответил не-2xx (404 / 401 / 403 / 5xx);
+ *   4) n8n ответил 2xx — запрос дошёл, смотреть надо в самом n8n.
+ ************************************************************/
+
+/**
+ * Маска секрета для лога и alert: первые 4 символа + «…» + длина.
+ * Полное значение не выводится нигде и никогда.
+ */
+function maskSecret_(value) {
+  const secret = (value === null || value === undefined) ? '' : String(value);
+
+  if (!secret) {
+    return 'N8N_SECRET НЕ НАЙДЕН В SCRIPT PROPERTIES';
+  }
+
+  return secret.slice(0, 4) + '… (' + secret.length + ')';
+}
+
+/**
+ * Размер тела запроса в байтах (UTF-8), а не в символах:
+ * кириллица в payload занимает по 2 байта.
+ */
+function payloadSizeBytes_(text) {
+  const s = String(text || '');
+
+  try {
+    return Utilities.newBlob(s).getBytes().length;
+  } catch (e) {
+    return s.length;
+  }
+}
+
+/**
+ * Первые 500 символов тела ответа — этого хватает и для JSON n8n,
+ * и для HTML-страницы ошибки прокси.
+ */
+function shortResponseText_(text) {
+  const s = String(text === null || text === undefined ? '' : text);
+
+  if (!s) return '(пустое тело ответа)';
+
+  return s.length > 500 ? s.slice(0, 500) + '…' : s;
+}
+
+/**
+ * Подсказка по HTTP-статусу: известные причины «нет executions».
+ */
+function httpStatusHint_(statusCode) {
+  const code = Number(statusCode);
+
+  if (code === 404) {
+    return 'ПОДСКАЗКА: вебхук не найден: workflow неактивен или URL не production ' +
+           '(проверьте /webhook/ vs /webhook-test/)';
+  }
+
+  if (code === 401 || code === 403) {
+    return 'ПОДСКАЗКА: не совпадает секрет/имя заголовка с Header Auth credential в n8n';
+  }
+
+  if (code >= 200 && code < 300) {
+    return 'ПОДСКАЗКА: запрос дошёл — если executions нет, проверьте фильтр executions в n8n (Production/Test)';
+  }
+
+  if (code >= 500) {
+    return 'ПОДСКАЗКА: ошибка на стороне n8n — смотрите логи сервера n8n';
+  }
+
+  return '';
+}
+
+/**
+ * Причина пропуска строки при отправке. Ровно те же условия, что
+ * и раньше в цикле отправки, — вынесены в функцию, чтобы предварительный
+ * подсчёт кандидатов и сама отправка не могли разойтись.
+ */
+function getSendSkipReason_(row, headerMap) {
+  const driveFileId = getCellByHeader_(row, headerMap, 'drive_file_id');
+  const parseError = getCellByHeader_(row, headerMap, 'error_text');
+  const sendStatus = getCellByHeader_(row, headerMap, 'transcription_send_status');
+  const receivedAt = getCellByHeader_(row, headerMap, 'transcription_received_at');
+
+  if (!driveFileId) return 'нет drive_file_id';
+  if (parseError) return 'есть error_text: ' + parseError;
+  if (sendStatus === 'SENT') return 'уже отправлено (transcription_send_status = SENT)';
+  if (receivedAt) return 'уже есть результат (transcription_received_at заполнено)';
+
+  // Строки со статусом ERROR НЕ пропускаются — повторяем отправку.
+  return '';
+}
+
+/**
+ * Предварительный разбор листа: сколько строк вообще проходит фильтр
+ * «ещё не отправлено» и, если таких нет, — почему.
+ * Счётчики причин считаются независимо друг от друга, поэтому их сумма
+ * может быть больше числа строк (у одной строки бывает несколько проблем).
+ */
+function analyzeSendCandidates_(values, headerMap) {
+  const stats = {
+    totalRows: values.length,
+    candidates: 0,
+    alreadySent: 0,
+    alreadyReceived: 0,
+    withParseError: 0,
+    withSendError: 0,
+    noCallKey: 0,
+    noDriveFileId: 0
+  };
+
+  values.forEach(function(row) {
+    if (!getSendSkipReason_(row, headerMap)) stats.candidates++;
+
+    if (!getCellByHeader_(row, headerMap, 'call_key')) stats.noCallKey++;
+    if (!getCellByHeader_(row, headerMap, 'drive_file_id')) stats.noDriveFileId++;
+    if (getCellByHeader_(row, headerMap, 'error_text')) stats.withParseError++;
+    if (getCellByHeader_(row, headerMap, 'transcription_error')) stats.withSendError++;
+    if (getCellByHeader_(row, headerMap, 'transcription_received_at')) stats.alreadyReceived++;
+    if (getCellByHeader_(row, headerMap, 'transcription_send_status') === 'SENT') stats.alreadySent++;
+  });
+
+  return stats;
+}
+
+/**
+ * Расшифровка «почему кандидатов ноль» — одной строкой для лога.
+ */
+function describeNoCandidates_(stats) {
+  return 'НЕТ СТРОК ДЛЯ ОТПРАВКИ. Всего строк: ' + stats.totalRows +
+    '; со статусом SENT: ' + stats.alreadySent +
+    '; с готовым результатом (transcription_received_at): ' + stats.alreadyReceived +
+    '; с ошибкой разбора (error_text): ' + stats.withParseError +
+    '; с ошибкой прошлой отправки (transcription_error): ' + stats.withSendError +
+    '; без call_key: ' + stats.noCallKey +
+    '; без drive_file_id: ' + stats.noDriveFileId +
+    '. Запрос в n8n не отправлялся — отправлять нечего.';
+}
+
+/**
+ * Показ сообщения пользователю. Вне UI-контекста (триггер, запуск из
+ * редактора) alert недоступен — тогда просто молчим, всё уже в логе.
+ */
+function showAlert_(title, message) {
+  try {
+    SpreadsheetApp.getUi().alert(title, message, SpreadsheetApp.getUi().ButtonSet.OK);
+  } catch (e) {
+    Logger.log(title + '\n' + message);
+  }
+}
+
+/**
+ * «Тест: пинг n8n» — POST без данных таблицы.
+ * Проверяет ровно три вещи: доходит ли запрос до хоста, какой у него
+ * итоговый URL и виден ли скрипту секрет из Script Properties.
+ * Строки таблицы не читаются и не изменяются.
+ */
+function pingN8nWebhook() {
+  const runId = 'ping-' + Date.now();
+  const log = [];
+  const report = [];
+
+  const push = function(step, details) {
+    const text = String(details || '');
+
+    log.push([
+      nowString_(),
+      runId,
+      String(step || ''),
+      '',
+      text.slice(0, 2000)
+    ]);
+
+    report.push(text);
+  };
+
+  try {
+    const url = String(CONFIG.N8N_WEBHOOK_URL || '').trim();
+
+    push('PING_START', 'Пинг n8n без данных таблицы.');
+    push('PING_URL', 'URL: ' + (url || '(пусто — CONFIG.N8N_WEBHOOK_URL не задан)'));
+    push(
+      'PING_SECRET',
+      'Заголовок: ' + CONFIG.N8N_SECRET_HEADER + ', значение: ' + maskSecret_(CONFIG.N8N_SECRET)
+    );
+
+    if (!url) {
+      push('PING_FINISH', 'Пинг не выполнен: не задан CONFIG.N8N_WEBHOOK_URL.');
+      showAlert_('Тест: пинг n8n', report.join('\n\n'));
+      return;
+    }
+
+    const body = JSON.stringify({
+      action: 'ping',
+      ts: new Date().toISOString()
+    });
+
+    const options = {
+      method: 'post',
+      contentType: 'application/json',
+      payload: body,
+      muteHttpExceptions: true,
+      headers: {}
+    };
+
+    options.headers[CONFIG.N8N_SECRET_HEADER] = String(CONFIG.N8N_SECRET || '');
+
+    push('PING_REQUEST', 'POST, тело: ' + body + ', размер: ' + payloadSizeBytes_(body) + ' байт.');
+
+    const startedAt = Date.now();
+
+    let response;
+
+    try {
+      response = UrlFetchApp.fetch(url, options);
+    } catch (e) {
+      const failedAfter = Date.now() - startedAt;
+
+      push(
+        'PING_ERROR',
+        'СЕТЬ: сервер не ответил за ' + failedAfter + ' мс (DNS / timeout / connect). ' +
+        'Текст ошибки: ' + String((e && e.message) || e)
+      );
+
+      showAlert_('Тест: пинг n8n', report.join('\n\n'));
+      return;
+    }
+
+    const durationMs = Date.now() - startedAt;
+    const statusCode = response.getResponseCode();
+    const hint = httpStatusHint_(statusCode);
+
+    push(
+      'PING_RESPONSE',
+      'HTTP ' + statusCode + ', ' + durationMs + ' мс. Ответ: ' + shortResponseText_(response.getContentText())
+    );
+
+    if (hint) push('PING_HINT', hint);
+
+    push('PING_FINISH', 'Пинг завершён.');
+
+    showAlert_('Тест: пинг n8n', report.join('\n\n'));
+
+  } catch (e) {
+    push('PING_FATAL', String((e && e.stack) || e));
+    showAlert_('Тест: пинг n8n', report.join('\n\n'));
+    throw e;
+  } finally {
+    flushLog_(log);
+  }
 }
 
 /************************************************************

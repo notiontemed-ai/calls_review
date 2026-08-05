@@ -1,15 +1,14 @@
 # Приложение «Контроль звонков». Все запросы — через index.php.
 Options -Indexes
 RewriteEngine On
-RewriteBase /
 # Реальные файлы фронтенда отдаём как есть
 RewriteCond %{REQUEST_FILENAME} -f
 RewriteCond %{REQUEST_URI} \.(css|js|html|svg|png|ico)$
 RewriteRule ^ - [L]
-# Всё остальное — в index.php
+# Всё остальное — в index.php этой папки
 RewriteRule ^ index.php [L]
 
-# Запрет прямого доступа к служебным файлам (вторая линия — та же проверка есть в index.php)
+# Запрет прямого доступа к служебным файлам
 <FilesMatch "^(config\.php|config\.example\.php|service-account\.json)$">
   Require all denied
 </FilesMatch>

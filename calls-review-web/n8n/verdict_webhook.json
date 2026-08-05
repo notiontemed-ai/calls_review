@@ -1,0 +1,129 @@
+{
+  "name": "QA: запись вердиктов",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "qa-verdict",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-600, 0],
+      "webhookId": "qa-verdict"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Проверка секрета и валидация payload.\n// ЗАМЕНИТЕ SECRET на значение n8n_webhook_secret из config.php.\nconst SECRET = 'ЗАМЕНИТЕ-НА-СЕКРЕТ';\nconst req = $input.first().json;\nconst headers = req.headers || {};\nif ((headers['x-auth-token'] || '') !== SECRET) {\n  throw new Error('FORBIDDEN: неверный X-Auth-Token');\n}\nconst body = req.body || {};\nconst reviewer = body.reviewer || {};\nconst items = Array.isArray(body.items) ? body.items : [];\nif (!reviewer.bitrix_user_id || !items.length) {\n  throw new Error('VALIDATION: reviewer/items');\n}\nfor (const it of items) {\n  if (!it.call_key) throw new Error('VALIDATION: call_key');\n  if (!['CONFIRM', 'CHANGE_SCORE'].includes(it.action)) throw new Error('VALIDATION: action');\n  if (it.action === 'CHANGE_SCORE') {\n    const s = Number(it.new_score);\n    if (!(s >= 1 && s <= 5)) throw new Error('VALIDATION: new_score');\n    if (!it.comment) throw new Error('VALIDATION: comment обязателен при CHANGE_SCORE');\n  }\n}\nreturn [{ json: { reviewer, items } }];"
+      },
+      "name": "Validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-380, 0]
+    },
+    {
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "url": "=https://sheets.googleapis.com/v4/spreadsheets/{{ $env.QA_MAIN_SPREADSHEET_ID }}/values/{{ encodeURIComponent('Записи звонков') }}",
+        "options": {}
+      },
+      "name": "Read Main Sheet",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-160, 0],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "jsCode": "// Находим строки по call_key, проверяем review_status, готовим записи.\n// Требуемые колонки основного листа: review_status, review_score, reviewed_by, reviewed_at.\nconst sheet = $('Read Main Sheet').first().json;\nconst { reviewer, items } = $('Validate').first().json;\nconst rows = sheet.values || [];\nif (!rows.length) throw new Error('Основной лист пуст');\nconst header = rows[0].map(String);\nconst col = (name) => header.indexOf(name);\nconst iKey = col('call_key');\nconst need = ['review_status', 'review_score', 'reviewed_by', 'reviewed_at'];\nfor (const n of need) if (col(n) < 0) throw new Error('Нет колонки ' + n + ' на листе «Записи звонков» — добавьте её в HEADERS Apps Script и пересканируйте.');\n\nconst toLetter = (i) => { let s = ''; i += 1; while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; };\nconst byKey = new Map();\nrows.forEach((r, idx) => { if (idx > 0 && r[iKey]) byKey.set(String(r[iKey]).trim(), { rowNumber: idx + 1, row: r }); });\n\nconst now = new Date();\nconst pad = (n) => String(n).padStart(2, '0');\nconst ts = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;\n\nconst journalRows = [];\nconst valueRanges = [];\nconst results = [];\nfor (const it of items) {\n  const found = byKey.get(it.call_key);\n  if (!found) { results.push({ call_key: it.call_key, ok: false, code: 'NOT_FOUND' }); continue; }\n  const status = String(found.row[col('review_status')] || '').trim();\n  if (status) { results.push({ call_key: it.call_key, ok: false, code: 'ALREADY_REVIEWED' }); continue; }\n  const snap = it.snapshot || {};\n  journalRows.push([\n    ts, it.call_key, String(reviewer.bitrix_user_id), reviewer.name || '', it.action,\n    snap.ai_score ?? '', it.action === 'CHANGE_SCORE' ? it.new_score : '', it.comment || '',\n    snap.group ?? '', snap.operator_name ?? '', snap.call_datetime ?? '', snap.client_phone ?? ''\n  ]);\n  const rangeRow = found.rowNumber;\n  valueRanges.push({\n    range: `Записи звонков!${toLetter(col('review_status'))}${rangeRow}:${toLetter(col('review_status'))}${rangeRow}`,\n    values: [[it.action === 'CONFIRM' ? 'CONFIRMED' : 'SCORE_CHANGED']]\n  });\n  valueRanges.push({ range: `Записи звонков!${toLetter(col('review_score'))}${rangeRow}`, values: [[it.action === 'CHANGE_SCORE' ? it.new_score : '']] });\n  valueRanges.push({ range: `Записи звонков!${toLetter(col('reviewed_by'))}${rangeRow}`, values: [[String(reviewer.bitrix_user_id)]] });\n  valueRanges.push({ range: `Записи звонков!${toLetter(col('reviewed_at'))}${rangeRow}`, values: [[ts]] });\n  results.push({ call_key: it.call_key, ok: true });\n}\nreturn [{ json: { journalRows, valueRanges, results, hasWrites: journalRows.length > 0 } }];"
+      },
+      "name": "Resolve Rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [60, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "strict", "version": 2 },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.hasWrites }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Has Writes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [280, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "url": "=https://sheets.googleapis.com/v4/spreadsheets/1VwcF6I1PjTFYw1Tpgav2t6qeZAkAaKzFm71aR5m0A80/values/{{ encodeURIComponent('Проверки') }}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ values: $json.journalRows }) }}",
+        "options": {}
+      },
+      "name": "Append Journal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [500, -100],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "url": "=https://sheets.googleapis.com/v4/spreadsheets/{{ $env.QA_MAIN_SPREADSHEET_ID }}/values:batchUpdate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ valueInputOption: 'RAW', data: $('Resolve Rows').first().json.valueRanges }) }}",
+        "options": {}
+      },
+      "name": "Update Review Columns",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, -100],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ results: $('Resolve Rows').first().json.results }) }}",
+        "options": {}
+      },
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [940, 0]
+    }
+  ],
+  "connections": {
+    "Webhook": { "main": [[{ "node": "Validate", "type": "main", "index": 0 }]] },
+    "Validate": { "main": [[{ "node": "Read Main Sheet", "type": "main", "index": 0 }]] },
+    "Read Main Sheet": { "main": [[{ "node": "Resolve Rows", "type": "main", "index": 0 }]] },
+    "Resolve Rows": { "main": [[{ "node": "Has Writes?", "type": "main", "index": 0 }]] },
+    "Has Writes?": {
+      "main": [
+        [{ "node": "Append Journal", "type": "main", "index": 0 }],
+        [{ "node": "Respond", "type": "main", "index": 0 }]
+      ]
+    },
+    "Append Journal": { "main": [[{ "node": "Update Review Columns", "type": "main", "index": 0 }]] },
+    "Update Review Columns": { "main": [[{ "node": "Respond", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" }
+}

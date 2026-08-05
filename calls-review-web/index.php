@@ -19,7 +19,9 @@ if ($docRoot !== '' && str_starts_with($appDir, $docRoot)) {
     $base = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'])), '/');
 }
 
-session_set_cookie_params(['lifetime' => (int)$cfg['session_lifetime'], 'httponly' => true, 'samesite' => 'Lax', 'secure' => !empty($_SERVER['HTTPS'])]);
+// Своё имя сессии — чтобы не конфликтовать с PHPSESSID Битрикс CMS на этом же домене.
+session_name('CALLSQASID');
+session_set_cookie_params(['lifetime' => (int)$cfg['session_lifetime'], 'path' => rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'])), '/') . '/', 'httponly' => true, 'samesite' => 'Lax', 'secure' => !empty($_SERVER['HTTPS'])]);
 session_start();
 
 $uriPath = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?: '/';

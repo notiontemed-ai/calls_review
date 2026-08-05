@@ -1,0 +1,5 @@
+calls-review-web/config.php
+calls-review-web/service-account.json
+calls-review-web/storage/*
+!calls-review-web/storage/.htaccess
+!calls-review-web/storage/.gitkeep

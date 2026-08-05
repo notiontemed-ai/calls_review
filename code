@@ -315,6 +315,7 @@ function onOpen() {
     .addSeparator()
     .addItem('Обновить сотрудников из Битрикс', 'refreshEmployeesFromBitrix')
     .addItem('Пересчитать операторов', 'recalculateOperatorNames')
+    .addItem('Обновить mango side', 'updateMangoSideList')
     .addItem(
       'Создать ежедневный триггер обновления сотрудников',
       'createEmployeesDailyRefreshTrigger'
@@ -1781,8 +1782,9 @@ const OPERATOR_RECALC_LOG_SAMPLE_LIMIT = 20;
 // десятки вызовов записи вместо сотен.
 const OPERATOR_RECALC_MAX_WRITE_GAP = 25;
 
-// Заголовки листа «Операторы» (ручной маппинг). Лист ведёт пользователь,
-// скрипт его только читает.
+// Заголовки листа «Операторы» (ручной маппинг). Колонку «Сотрудник» ведёт
+// пользователь; ключи mango_side скрипт умеет дописывать пунктом меню
+// «Обновить mango side» (updateMangoSideList).
 const OPERATORS_KEY_HEADER = 'mango_side';
 const OPERATORS_VALUE_HEADER = 'Сотрудник';
 
@@ -2518,6 +2520,182 @@ function recalculateOperatorNames() {
   } catch (e) {
     push('OPERATOR_RECALC_ERROR', '', String((e && e.stack) || e));
     showToast_('Ошибка пересчёта операторов: ' + String((e && e.message) || e));
+    throw e;
+  } finally {
+    lock.releaseLock();
+    flushLog_(log);
+  }
+}
+
+/************************************************************
+ * ОБНОВЛЕНИЕ СПИСКА mango_side НА ЛИСТЕ «Операторы»
+ *
+ * Пункт меню «Обновить mango side»: собирает уникальные значения
+ * mango_side с листа «Записи звонков» и дописывает отсутствующие
+ * снизу листа «Операторы». Колонка «Сотрудник» у новых строк
+ * остаётся пустой — её заполняет пользователь.
+ *
+ * Сравнение значений — по normalizeFio_, как в loadOperatorMapping_:
+ * регистр, «ё» и лишние пробелы различий не создают. На лист попадает
+ * первый встретившийся сырой вариант значения.
+ *
+ * Результат показывается модальным окном: список добавленных значений
+ * либо сообщение, что новых нет. Запуск идемпотентен: повторный прогон
+ * без новых звонков ничего не дописывает.
+ ************************************************************/
+
+function updateMangoSideList() {
+  const runId = 'mango-side-' + Date.now();
+  const log = [];
+
+  const push = function(step, file, details) {
+    log.push([
+      nowString_(),
+      runId,
+      String(step || ''),
+      String(file || '').slice(0, 300),
+      String(details || '').slice(0, 2000)
+    ]);
+  };
+
+  const lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(SHEET_LOCK_TIMEOUT_MS)) {
+    push(
+      'MANGO_SIDE_UPDATE_LOCKED',
+      '',
+      'Другая операция уже выполняется (lock не получен за ' +
+        SHEET_LOCK_TIMEOUT_MS + ' мс). Запуск пропущен.'
+    );
+
+    flushLog_(log);
+    showToast_('Обновление mango side: другая операция уже выполняется');
+    return;
+  }
+
+  try {
+    push(
+      'MANGO_SIDE_UPDATE_START',
+      '',
+      'Сбор уникальных mango_side с листа «' + CONFIG.SHEET_NAME + '»'
+    );
+
+    const callsSheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.SHEET_NAME);
+
+    if (!callsSheet) {
+      throw new Error('Лист «' + CONFIG.SHEET_NAME + '» не найден.');
+    }
+
+    const callsHeaderMap = getHeaderMap_(callsSheet);
+    const mangoSideColumn = callsHeaderMap.mango_side;
+
+    if (!mangoSideColumn) {
+      throw new Error('На листе «' + CONFIG.SHEET_NAME + '» нет колонки mango_side.');
+    }
+
+    // Уникальные значения со звонков: ключ — normalizeFio_, значение —
+    // первый встретившийся сырой вариант (он и попадёт на лист).
+    // Пустые mango_side (строки с ошибкой разбора имени файла) пропускаются.
+    const seen = {};
+    const lastCallRow = callsSheet.getLastRow();
+
+    if (lastCallRow >= 2) {
+      callsSheet
+        .getRange(2, mangoSideColumn, lastCallRow - 1, 1)
+        .getValues()
+        .forEach(function(row) {
+          const raw = String(row[0] === null || row[0] === undefined ? '' : row[0]).trim();
+          if (!raw) return;
+
+          const key = normalizeFio_(raw);
+          if (!key) return;
+
+          if (seen[key] === undefined) seen[key] = raw;
+        });
+    }
+
+    // Лист «Операторы»: отсутствует или пуст — создаётся/размечается
+    // заголовками mango_side и Сотрудник.
+    let operatorsSheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.OPERATORS_SHEET_NAME);
+
+    if (!operatorsSheet) {
+      operatorsSheet = SpreadsheetApp.getActive().insertSheet(CONFIG.OPERATORS_SHEET_NAME);
+    }
+
+    if (operatorsSheet.getLastRow() < 1 || operatorsSheet.getLastColumn() < 1) {
+      operatorsSheet
+        .getRange(1, 1, 1, 2)
+        .setValues([[OPERATORS_KEY_HEADER, OPERATORS_VALUE_HEADER]]);
+
+      push(
+        'MANGO_SIDE_SHEET_CREATED',
+        '',
+        'Лист «' + CONFIG.OPERATORS_SHEET_NAME + '» размечен колонками «' +
+          OPERATORS_KEY_HEADER + '» и «' + OPERATORS_VALUE_HEADER + '».'
+      );
+    }
+
+    const operatorsHeaderMap = getHeaderMap_(operatorsSheet);
+    const keyColumn = operatorsHeaderMap[OPERATORS_KEY_HEADER];
+
+    if (!keyColumn) {
+      throw new Error(
+        'На листе «' + CONFIG.OPERATORS_SHEET_NAME + '» нет колонки «' +
+          OPERATORS_KEY_HEADER + '».'
+      );
+    }
+
+    // Значения, уже известные листу, — по тому же нормализованному ключу.
+    const known = {};
+    const lastOperatorRow = operatorsSheet.getLastRow();
+
+    if (lastOperatorRow >= 2) {
+      operatorsSheet
+        .getRange(2, keyColumn, lastOperatorRow - 1, 1)
+        .getValues()
+        .forEach(function(row) {
+          const key = normalizeFio_(row[0]);
+          if (key) known[key] = true;
+        });
+    }
+
+    const added = [];
+
+    Object.keys(seen).forEach(function(key) {
+      if (!known[key]) added.push(seen[key]);
+    });
+
+    added.sort(function(a, b) { return a.localeCompare(b, 'ru'); });
+
+    if (added.length) {
+      operatorsSheet
+        .getRange(lastOperatorRow + 1, keyColumn, added.length, 1)
+        .setValues(added.map(function(value) { return [value]; }));
+    }
+
+    const details =
+      'Уникальных mango_side в звонках: ' + Object.keys(seen).length +
+      ', на листе было: ' + Object.keys(known).length +
+      ', добавлено: ' + added.length +
+      (added.length ? '. Новые: ' + added.join('; ') : '');
+
+    push('MANGO_SIDE_UPDATE_FINISH', '', details);
+
+    if (added.length) {
+      showAlert_(
+        'Обновить mango side',
+        'Добавлено новых значений: ' + added.length + '\n\n' +
+          added.join('\n') + '\n\n' +
+          'Заполните колонку «' + OPERATORS_VALUE_HEADER + '» на листе «' +
+          CONFIG.OPERATORS_SHEET_NAME + '».'
+      );
+    } else {
+      showAlert_('Обновить mango side', 'Новых значений mango_side нет.');
+    }
+
+  } catch (e) {
+    push('MANGO_SIDE_UPDATE_ERROR', '', String((e && e.stack) || e));
+    showAlert_('Обновить mango side', 'Ошибка: ' + String((e && e.message) || e));
     throw e;
   } finally {
     lock.releaseLock();

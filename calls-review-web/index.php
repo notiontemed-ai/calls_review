@@ -38,6 +38,18 @@ function require_user(): array {
     if (empty($_SESSION['user'])) json_out(['error' => 'UNAUTHORIZED'], 401);
     return $_SESSION['user'];
 }
+/** index.html с версионированной статикой: app.css/app.js получают ?v=filemtime. */
+function serve_index(): never {
+    $html = (string)file_get_contents(__DIR__ . '/index.html');
+    foreach (['app.css', 'app.js'] as $f) {
+        $v = (string)@filemtime(__DIR__ . '/' . $f);
+        $html = str_replace('"' . $f . '"', '"' . $f . '?v=' . $v . '"', $html);
+    }
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-cache');
+    echo $html;
+    exit;
+}
 function app_log(array $cfg, string $line): void {
     @file_put_contents(rtrim($cfg['cache_dir'], '/') . '/app.log',
         date('c') . ' ' . $line . "\n", FILE_APPEND | LOCK_EX);
@@ -174,18 +186,19 @@ try {
     if (preg_match('#^/(config|service-account|src/|storage/|n8n/|apps_script/)#', $path)) {
         http_response_code(403); exit('Forbidden');
     }
-    $file = __DIR__ . ($path === '/' ? '/index.html' : $path);
-    $real = realpath($file);
+    // index.html всегда через serve_index() — иначе браузер получит ссылки без версий.
+    if ($path === '/' || $path === '/index.html') serve_index();
+    $real = realpath(__DIR__ . $path);
     if ($real && str_starts_with($real, __DIR__) && is_file($real)) {
         $ext = pathinfo($real, PATHINFO_EXTENSION);
         $mime = ['html' => 'text/html', 'js' => 'application/javascript', 'css' => 'text/css', 'svg' => 'image/svg+xml'][$ext] ?? 'application/octet-stream';
         header('Content-Type: ' . $mime . '; charset=utf-8');
+        header('Cache-Control: public, max-age=31536000, immutable');
         readfile($real);
         exit;
     }
     // SPA fallback
-    header('Content-Type: text/html; charset=utf-8');
-    readfile(__DIR__ . '/index.html');
+    serve_index();
 
 } catch (Throwable $e) {
     app_log($cfg, 'ERROR ' . $e->getMessage());

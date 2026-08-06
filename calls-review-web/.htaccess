@@ -1,9 +1,10 @@
 # Приложение «Контроль звонков». Все запросы — через index.php.
 Options -Indexes
 RewriteEngine On
-# Реальные файлы фронтенда отдаём как есть
+# Реальные файлы фронтенда отдаём как есть (html — нет: index.html идёт через index.php,
+# который подставляет ?v= к app.css/app.js)
 RewriteCond %{REQUEST_FILENAME} -f
-RewriteCond %{REQUEST_URI} \.(css|js|html|svg|png|ico)$
+RewriteCond %{REQUEST_URI} \.(css|js|svg|png|ico)$
 RewriteRule ^ - [L]
 # Всё остальное — в index.php этой папки
 RewriteRule ^ index.php [L]

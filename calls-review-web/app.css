@@ -135,6 +135,11 @@ th.sortable:hover{color:var(--accent)}
 .loading{color:var(--ink-soft);padding:30px;text-align:center}
 .empty{color:var(--ink-soft);padding:36px;text-align:center}
 
+/* Плашка фатальной ошибки рендера (#app-fatal) — заметная, но интерфейс под ней виден. */
+.fatal{background:var(--bad-soft);color:var(--bad);border-bottom:1px solid var(--bad);
+  padding:12px 22px;font-size:.95em;line-height:1.4}
+.fatal .msg{color:var(--ink-soft);font-size:.85em;margin-top:6px;word-break:break-word}
+
 @media (max-width:800px){
   .page{padding:14px}
   th{top:0}

@@ -1,11 +1,18 @@
 /* Контроль звонков — SPA. Vue 3 (global build), без сборки. */
+const BUILD = '2026-08-06 07:20';   // обновлять при каждой правке app.js — видно в консоли, отличает кеш от свежего файла
+console.info('calls-review build', BUILD);
+
 const { createApp, ref, reactive, computed, onMounted, watch } = Vue;
 
 const api = async (url, opts = {}) => {
   const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
-  const j = await r.json().catch(() => ({}));
+  const ct = r.headers.get('content-type') || '';
+  const j = await r.json().catch(() => null);
   if (r.status === 401) { app._instance.exposed.setUser(null); throw new Error('UNAUTHORIZED'); }
-  if (!r.ok) throw new Error(j.message || j.error || ('HTTP ' + r.status));
+  if (!r.ok) throw new Error(j?.message || j?.error || ('HTTP ' + r.status));
+  // Не-JSON или не объект — обычно PHP-warning перед телом ответа либо отдача html вместо API.
+  // Лучше явная ошибка, чем падение шаблона на неожиданной структуре.
+  if (!ct.includes('application/json') || typeof j !== 'object' || j === null) throw new Error('BAD_RESPONSE: ' + url);
   return j;
 };
 const today = () => new Date().toISOString().slice(0, 10);
@@ -198,7 +205,7 @@ const app = createApp({
       <div v-if="!summary" class="loading">Загрузка сводки…</div>
       <template v-else>
         <div class="group-cards">
-          <div class="gcard" v-for="g in summary.groups" :key="g.group" @click="goGroup(g.group, summary.date)">
+          <div class="gcard" v-for="g in (summary.groups || [])" :key="g.group" @click="goGroup(g.group, summary.date)">
             <div class="gname">{{ g.group }}</div>
             <div class="big mono">{{ g.calls }}<small>звонков</small></div>
             <div class="rows">
@@ -218,7 +225,7 @@ const app = createApp({
           <div class="empty">За выбранный день звонков нет.</div>
         </div>
         <template v-else>
-          <div class="panel" v-if="summary.operators_sales.length">
+          <div class="panel" v-if="(summary.operators_sales || []).length">
             <h3>Нагрузка на операторов · Продажи</h3>
             <table>
               <thead><tr>
@@ -227,7 +234,7 @@ const app = createApp({
                 <th class="num">Общее время</th><th class="num">Средний балл</th>
               </tr></thead>
               <tbody>
-                <tr v-for="o in summary.operators_sales" :key="o.operator" style="cursor:pointer" @click="goOperator(o.operator, summary.date)">
+                <tr v-for="o in (summary.operators_sales || [])" :key="o.operator" style="cursor:pointer" @click="goOperator(o.operator, summary.date)">
                   <td>{{ o.operator }}</td>
                   <td class="num mono">{{ o.calls }}</td>
                   <td class="num mono">{{ o.target }}</td>
@@ -240,12 +247,12 @@ const app = createApp({
             </table>
           </div>
 
-          <div class="panel" v-if="summary.operators_service.length">
+          <div class="panel" v-if="(summary.operators_service || []).length">
             <h3>Нагрузка на операторов · Сервис</h3>
             <table>
               <thead><tr><th>Оператор</th><th class="num">Звонков</th><th class="num">Общее время</th><th class="num">Средний балл</th></tr></thead>
               <tbody>
-                <tr v-for="o in summary.operators_service" :key="o.operator" style="cursor:pointer" @click="goOperator(o.operator, summary.date)">
+                <tr v-for="o in (summary.operators_service || [])" :key="o.operator" style="cursor:pointer" @click="goOperator(o.operator, summary.date)">
                   <td>{{ o.operator }}</td>
                   <td class="num mono">{{ o.calls }}</td>
                   <td class="num mono">{{ o.duration }}</td>
@@ -255,12 +262,12 @@ const app = createApp({
             </table>
           </div>
 
-          <div class="panel" v-if="summary.operators_other.length">
+          <div class="panel" v-if="(summary.operators_other || []).length">
             <h3>Нагрузка на операторов · Прочие</h3>
             <table>
               <thead><tr><th>Оператор</th><th>Группа</th><th class="num">Звонков</th><th class="num">Общее время</th><th class="num">Средний балл</th></tr></thead>
               <tbody>
-                <tr v-for="o in summary.operators_other" :key="o.operator" style="cursor:pointer" @click="goOperator(o.operator, summary.date)">
+                <tr v-for="o in (summary.operators_other || [])" :key="o.operator" style="cursor:pointer" @click="goOperator(o.operator, summary.date)">
                   <td>{{ o.operator }}</td>
                   <td><span class="badge neutral">{{ o.group }}</span></td>
                   <td class="num mono">{{ o.calls }}</td>
@@ -294,7 +301,7 @@ const app = createApp({
 
       <div class="panel">
         <div v-if="loading" class="loading">Загрузка…</div>
-        <div v-else-if="!list || !list.items.length" class="empty">По выбранным условиям звонков нет. Измените период или фильтры.</div>
+        <div v-else-if="!list || !(list.items || []).length" class="empty">По выбранным условиям звонков нет. Измените период или фильтры.</div>
         <table v-else>
           <thead><tr>
             <th style="width:34px"><input type="checkbox" :checked="allPageSelected" @change="togglePage"></th>
@@ -306,7 +313,7 @@ const app = createApp({
             <th>Статус</th><th></th>
           </tr></thead>
           <tbody>
-            <tr v-for="c in list.items" :key="c.call_key">
+            <tr v-for="c in (list.items || [])" :key="c.call_key">
               <td><input type="checkbox" v-if="c.reviewable && !c.review_status" :checked="selected.has(c.call_key)" @change="toggle(c.call_key)"></td>
               <td class="mono">{{ fmtDT(c.call_datetime) }}</td>
               <td><span class="badge neutral">{{ c.group }}</span></td>
@@ -350,7 +357,7 @@ const app = createApp({
       <div class="drawer">
         <div class="drawer-head">
           <button class="btn" :disabled="cardIndex<=0" @click="nav(-1)">←</button>
-          <button class="btn" :disabled="cardIndex<0 || cardIndex>=(list?.items.length||0)-1" @click="nav(1)">→</button>
+          <button class="btn" :disabled="cardIndex<0 || cardIndex>=((list?.items || []).length)-1" @click="nav(1)">→</button>
           <h3 class="mono">{{ fmtDT(card.call_datetime) }} · {{ card.operator_name || '—' }}</h3>
           <button class="close" @click="closeCard">✕</button>
         </div>
@@ -444,4 +451,12 @@ const app = createApp({
   </template>
   `
 });
+// Необработанное исключение в render-функции оставляет #app пустым (серый экран).
+// Показываем плашку с текстом ошибки, чтобы пользователь понял, что делать.
+app.config.errorHandler = (err) => {
+  console.error(err);
+  const el = document.getElementById('app-fatal');
+  if (el) { el.style.display = 'block'; el.querySelector('.msg').textContent = String(err); }
+};
+
 app.mount('#app');

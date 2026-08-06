@@ -59,7 +59,8 @@ a{color:var(--accent)}
 .badge.bad{background:var(--bad-soft);color:var(--bad)}
 .badge.neutral{background:var(--bg);color:var(--ink-soft)}
 /* ячейка статуса: качество и проверка — независимые бейджи */
-.status-cell{display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+.status-cell{white-space:normal}
+.status-cell .badge{margin:1px 4px 1px 0;vertical-align:middle}
 
 /* ---------- таблицы ---------- */
 .panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}

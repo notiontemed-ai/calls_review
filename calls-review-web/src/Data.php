@@ -204,6 +204,17 @@ final class Data
                     array_filter($gc, fn($c) => $c['direction'] === 'INBOUND' && $c['client_phone'] !== '')
                 )));
                 $row += self::conversionByClient($gc);
+                // Уникальные клиенты (взаимоисключающе): целевой — есть хотя бы один
+                // целевой звонок за день; нецелевой — целевых нет, есть нецелевые.
+                // unique_target совпадает с базой конверсии (target).
+                $row['unique_target'] = $row['target'];
+                $hasTarget = [];
+                foreach ($gc as $c) {
+                    if ($c['client_phone'] === '' || $c['skipped_short']) continue;
+                    if ($c['is_target_call'] === 'TRUE') $hasTarget[$c['client_phone']] = true;
+                    elseif ($c['is_target_call'] === 'FALSE') $hasTarget[$c['client_phone']] ??= false;
+                }
+                $row['unique_non_target'] = count(array_filter($hasTarget, fn($t) => !$t));
             }
             $groups[] = $row;
         }

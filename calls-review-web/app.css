@@ -58,10 +58,13 @@ a{color:var(--accent)}
 .badge.ok{background:var(--ok-soft);color:var(--ok)}
 .badge.bad{background:var(--bad-soft);color:var(--bad)}
 .badge.neutral{background:var(--bg);color:var(--ink-soft)}
+/* ячейка статуса: качество и проверка — независимые бейджи */
+.status-cell{display:flex;gap:4px;flex-wrap:wrap;align-items:center}
 
 /* ---------- таблицы ---------- */
 .panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
 .panel h3{margin:0;padding:14px 18px;border-bottom:1px solid var(--line);font-size:1em}
+.panel + .panel{margin-top:18px}
 table{width:100%;border-collapse:collapse;font-size:.92em}
 th{color:var(--ink-soft);font-weight:500;text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);white-space:nowrap;background:var(--surface);position:sticky;top:56px}
 td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:middle}

@@ -3,7 +3,9 @@
  * MANGO CALLS → GOOGLE SHEETS → N8N (ТРАНСКРИБАЦИЯ)
  * Минимальная версия для отладки.
  *
- * Меню: «Обновить список записей» и «Отправить в n8n».
+ * Меню: «Обновить список записей», «Отправить в n8n» (ручные порции)
+ * и «Автоотправка» — триггер шлёт до AUTO_SEND_BATCH_SIZE записей
+ * каждые AUTO_SEND_INTERVAL_MINUTES минут, не перегружая n8n.
  * Лог каждого шага пишется на лист «Лог».
  *
  * Скрипт привязан к таблице, ID таблицы берётся автоматически.
@@ -41,6 +43,13 @@ const CONFIG = {
   MIN_AUDIO_FILE_SIZE_BYTES: 150 * 1024,
 
   RENAME_FILES_ON_DRIVE: true,
+
+  // --- Автоотправка в n8n порциями ---
+  // Триггер срабатывает каждую минуту, но реальная отправка идёт не чаще
+  // AUTO_SEND_INTERVAL_MINUTES (Apps Script умеет только 1/5/10/15/30 минут,
+  // поэтому «каждые 6 минут» реализовано минутным триггером с проверкой паузы).
+  AUTO_SEND_BATCH_SIZE: 50,
+  AUTO_SEND_INTERVAL_MINUTES: 6,
 
   N8N_WEBHOOK_URL: 'https://n8n-x3.tech.temed.ru/webhook/mango-call-transcribe-stereo-safe-v2',
 
@@ -313,6 +322,13 @@ function onOpen() {
     .addSeparator()
     .addItem('Отправить в n8n', 'sendNewCallsToTranscriptionN8n')
     .addSeparator()
+    .addItem(
+      'Автоотправка: включить (' + CONFIG.AUTO_SEND_BATCH_SIZE + ' записей / ' +
+        CONFIG.AUTO_SEND_INTERVAL_MINUTES + ' мин)',
+      'createAutoSendTrigger'
+    )
+    .addItem('Автоотправка: выключить', 'deleteAutoSendTrigger')
+    .addSeparator()
     .addItem('Обновить сотрудников из Битрикс', 'refreshEmployeesFromBitrix')
     .addItem('Пересчитать операторов', 'recalculateOperatorNames')
     .addItem('Обновить mango side', 'updateMangoSideList')
@@ -570,7 +586,7 @@ function scanMangoRecordingsFolder() {
       ', ошибок: ' + errors;
 
     push('FINISH', '', message);
-    SpreadsheetApp.getActive().toast(message);
+    showToast_(message);
 
   } catch (e) {
     push('FATAL', '', String((e && e.stack) || e));
@@ -607,6 +623,37 @@ function sendNewCallsToTranscriptionN8n100() {
 }
 
 function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
+  // Один запуск отправки одновременно: ручной из меню и автоотправка по
+  // триггеру берут общий лок. Иначе два параллельных запуска отобрали бы
+  // одни и те же строки-кандидаты и отправили их в n8n дважды.
+  //
+  // Лок именно documentLock, а НЕ scriptLock: scriptLock держат скан,
+  // обновление сотрудников и пересчёт операторов, а порция из 50 записей
+  // идёт минуты — на общем локе скан начал бы стабильно падать в SCAN_LOCKED.
+  const lock = LockService.getDocumentLock();
+
+  // Ждать нечего: соседний запуск шлёт свою порцию минутами, а следующая
+  // порция и так придёт по триггеру — пропускаем запуск сразу.
+  if (!lock.tryLock(0)) {
+    flushLog_([[
+      nowString_(),
+      'send-' + Date.now(),
+      'SEND_SKIPPED_LOCKED',
+      '',
+      'Отправка пропущена: предыдущий запуск ещё выполняется.'
+    ]]);
+    showToast_('Отправка уже идёт — запуск пропущен.');
+    return;
+  }
+
+  try {
+    sendNewCallsToTranscriptionN8nLocked_(maxToSend);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function sendNewCallsToTranscriptionN8nLocked_(maxToSend) {
   const sendLimit = normalizeSendLimit_(maxToSend);
   const limitText = sendLimit === null ? '∞ (все подходящие записи)' : String(sendLimit);
   const runId = 'send-' + Date.now();
@@ -661,7 +708,7 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
 
       push('PROMPTS_ERROR', '', promptsError);
       push('FINISH', '', 'Отправка отменена: ' + promptsError);
-      SpreadsheetApp.getActive().toast('Отправка отменена: проверьте лист «' + CONFIG.PROMPTS_SHEET_NAME + '».');
+      showToast_('Отправка отменена: проверьте лист «' + CONFIG.PROMPTS_SHEET_NAME + '».');
       showAlert_('Отправка в n8n', promptsError);
       return;
     }
@@ -699,7 +746,7 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
 
       push('NO_CANDIDATES', '', emptyMessage);
       push('FINISH', '', emptyMessage + ' Время: ' + (Date.now() - runStartedAt) + ' мс.');
-      SpreadsheetApp.getActive().toast('Нет строк для отправки.');
+      showToast_('Нет строк для отправки.');
       showAlert_('Отправка в n8n', emptyMessage);
       return;
     }
@@ -727,7 +774,7 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
 
       push('NO_CANDIDATES', '', noCandidatesMessage);
       push('FINISH', '', noCandidatesMessage + ' Время: ' + (Date.now() - runStartedAt) + ' мс.');
-      SpreadsheetApp.getActive().toast('Нет строк для отправки.');
+      showToast_('Нет строк для отправки.');
       showAlert_('Отправка в n8n', noCandidatesMessage);
       return;
     }
@@ -806,13 +853,106 @@ function sendNewCallsToTranscriptionN8nWithLimit_(maxToSend) {
       (aborted ? ' (прервано: n8n недоступен)' : '');
 
     push('FINISH', '', message);
-    SpreadsheetApp.getActive().toast(message);
+    showToast_(message);
     showAlert_('Отправка в n8n', message);
 
   } catch (e) {
     push('FATAL', '', String((e && e.stack) || e));
     throw e;
   }
+}
+
+/************************************************************
+ * АВТООТПРАВКА В N8N (ТРИГГЕР)
+ ************************************************************/
+
+const AUTO_SEND_TRIGGER_HANDLER = 'autoSendCallsToTranscriptionN8n';
+const AUTO_SEND_LAST_RUN_PROP = 'AUTO_SEND_LAST_RUN_AT';
+
+/**
+ * Обработчик минутного триггера. Реальная отправка — не чаще
+ * CONFIG.AUTO_SEND_INTERVAL_MINUTES и не больше CONFIG.AUTO_SEND_BATCH_SIZE
+ * записей за раз: n8n получает ровную нагрузку вместо лавины запросов.
+ * Пустая очередь ничего не стоит: отбор кандидатов завершается за секунды.
+ */
+function autoSendCallsToTranscriptionN8n() {
+  const props = PropertiesService.getScriptProperties();
+  const intervalMs = autoSendIntervalMinutes_() * 60 * 1000;
+  const lastRunAt = Number(props.getProperty(AUTO_SEND_LAST_RUN_PROP) || 0);
+  const now = Date.now();
+
+  if (now - lastRunAt < intervalMs) {
+    return; // пауза ещё не прошла — в «Лог» не пишем, чтобы не засорять его каждую минуту
+  }
+
+  // Метка ставится ДО отправки: даже если запуск упадёт или затянется,
+  // следующий начнётся не раньше чем через интервал от старта этого.
+  props.setProperty(AUTO_SEND_LAST_RUN_PROP, String(now));
+
+  sendNewCallsToTranscriptionN8nWithLimit_(CONFIG.AUTO_SEND_BATCH_SIZE);
+}
+
+/**
+ * Включает автоотправку. Старые триггеры удаляются — повторный запуск их не плодит.
+ */
+function createAutoSendTrigger() {
+  const removed = deleteAutoSendTriggers_();
+
+  ScriptApp.newTrigger(AUTO_SEND_TRIGGER_HANDLER)
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+
+  // Первая порция уходит на ближайшем срабатывании, а не через интервал.
+  PropertiesService.getScriptProperties().deleteProperty(AUTO_SEND_LAST_RUN_PROP);
+
+  const message = 'Автоотправка включена: до ' + CONFIG.AUTO_SEND_BATCH_SIZE +
+    ' записей каждые ' + autoSendIntervalMinutes_() +
+    ' мин. Удалено старых триггеров: ' + removed;
+
+  flushLog_([[nowString_(), 'autosend-trigger-' + Date.now(), 'AUTOSEND_TRIGGER_CREATED', '', message]]);
+  showToast_(message);
+  showAlert_('Автоотправка в n8n', message);
+}
+
+/**
+ * Выключает автоотправку (пункт меню).
+ */
+function deleteAutoSendTrigger() {
+  const removed = deleteAutoSendTriggers_();
+  const message = removed > 0
+    ? 'Автоотправка выключена. Удалено триггеров: ' + removed
+    : 'Автоотправка и так была выключена.';
+
+  flushLog_([[nowString_(), 'autosend-trigger-' + Date.now(), 'AUTOSEND_TRIGGER_DELETED', '', message]]);
+  showToast_(message);
+  showAlert_('Автоотправка в n8n', message);
+}
+
+/**
+ * Удаляет все триггеры автоотправки. Возвращает их количество.
+ */
+function deleteAutoSendTriggers_() {
+  const triggers = ScriptApp.getProjectTriggers();
+  let removed = 0;
+
+  triggers.forEach(function(trigger) {
+    if (trigger.getHandlerFunction() === AUTO_SEND_TRIGGER_HANDLER) {
+      ScriptApp.deleteTrigger(trigger);
+      removed++;
+    }
+  });
+
+  return removed;
+}
+
+/**
+ * Интервал автоотправки в минутах: не меньше 1, даже если CONFIG испорчен.
+ */
+function autoSendIntervalMinutes_() {
+  const minutes = Number(CONFIG.AUTO_SEND_INTERVAL_MINUTES);
+
+  return Number.isFinite(minutes) && minutes >= 1 ? Math.floor(minutes) : 6;
 }
 
 function normalizeSendLimit_(limit) {

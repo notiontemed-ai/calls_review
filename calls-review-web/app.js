@@ -213,7 +213,8 @@ const app = createApp({
               <span>Вход. / исх.: <b class="mono">{{ g.inbound }} / {{ g.outbound }}</b></span>
               <span v-if="g.unique_inbound !== undefined">Уник. входящих: <b class="mono">{{ g.unique_inbound }}</b></span>
               <span v-if="g.target_calls !== undefined">Целевые / нецелевые: <b class="mono">{{ g.target_calls }} / {{ g.non_target }}</b></span>
-              <span v-if="g.conversion !== undefined" title="записей / уникальных целевых состоявшихся">Конверсия в запись:
+              <span v-if="g.unique_target !== undefined" title="уникальные клиенты: целевой — есть хотя бы один целевой звонок за день; нецелевой — только нецелевые">Уник. целевые / нецелевые: <b class="mono">{{ g.unique_target }} / {{ g.unique_non_target }}</b></span>
+              <span v-if="g.conversion !== undefined" title="записавшихся / уникальных целевых клиентов">Конверсия по уник. целевым:
                 <b class="mono">{{ g.conversion ?? '—' }}%</b> ({{ g.booked }} / {{ g.target }})</span>
               <span><span class="badge" :class="g.unreviewed ? 'warn' : 'ok'">непроверенных: {{ g.unreviewed }}</span></span>
             </div>

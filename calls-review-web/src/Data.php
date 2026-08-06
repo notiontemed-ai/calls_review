@@ -190,38 +190,78 @@ final class Data
             $row = [
                 'group' => $g,
                 'calls' => count($gc),
+                'inbound'  => count(array_filter($gc, fn($c) => $c['direction'] === 'INBOUND')),
+                'outbound' => count(array_filter($gc, fn($c) => $c['direction'] === 'OUTBOUND')),
                 'avg_score' => $scored ? round(array_sum(array_map(fn($c) => $c['effective_score'], $scored)) / count($scored), 2) : null,
                 'unreviewed' => count(array_filter($gc, fn($c) => $c['reviewable'] && $c['review_status'] === '')),
             ];
             if ($g === 'Продажи') {
-                $target = array_filter($gc, fn($c) => $c['is_target_call'] === 'TRUE');
-                $booked = array_filter($target, fn($c) => $c['is_appointment_booked'] === 'TRUE');
-                $row['target'] = count($target);
-                $row['non_target'] = count(array_filter($gc, fn($c) => $c['is_target_call'] === 'FALSE'));
-                $row['booked'] = count($booked);
-                $row['conversion'] = count($target) ? round(100 * count($booked) / count($target), 1) : null;
+                // Целевые/нецелевые — по звонкам; конверсия и уникальные — по клиентам.
+                $row['target_calls'] = count(array_filter($gc, fn($c) => $c['is_target_call'] === 'TRUE'));
+                $row['non_target']   = count(array_filter($gc, fn($c) => $c['is_target_call'] === 'FALSE'));
+                $row['unique_inbound'] = count(array_unique(array_map(
+                    fn($c) => $c['client_phone'],
+                    array_filter($gc, fn($c) => $c['direction'] === 'INBOUND' && $c['client_phone'] !== '')
+                )));
+                $row += self::conversionByClient($gc);
             }
             $groups[] = $row;
         }
 
-        $ops = [];
+        $byOperator = [];
         foreach ($day as $c) {
             if ($c['operator_name'] === '') continue;
-            $k = $c['operator_name'];
-            $ops[$k] ??= ['operator' => $k, 'group' => $c['group'], 'calls' => 0, 'seconds' => 0, 'score_sum' => 0.0, 'score_n' => 0];
-            $ops[$k]['calls']++;
-            $ops[$k]['seconds'] += (int)$c['call_duration_seconds'];
-            if ($c['effective_score'] !== null) { $ops[$k]['score_sum'] += $c['effective_score']; $ops[$k]['score_n']++; }
+            $byOperator[$c['operator_name']][] = $c;
         }
-        $operators = array_map(function ($o) {
-            $o['avg_score'] = $o['score_n'] ? round($o['score_sum'] / $o['score_n'], 2) : null;
-            $o['duration'] = sprintf('%d:%02d', intdiv($o['seconds'], 60), $o['seconds'] % 60);
-            unset($o['score_sum'], $o['score_n']);
-            return $o;
-        }, array_values($ops));
+        $operators = [];
+        foreach ($byOperator as $name => $oc) {
+            $seconds = array_sum(array_map(fn($c) => (int)$c['call_duration_seconds'], $oc));
+            $scored  = array_filter($oc, fn($c) => $c['effective_score'] !== null);
+            $o = [
+                'operator'  => $name,
+                'group'     => $oc[0]['group'],
+                'calls'     => count($oc),
+                'seconds'   => $seconds,
+                'duration'  => sprintf('%d:%02d', intdiv($seconds, 60), $seconds % 60),
+                'avg_score' => $scored ? round(array_sum(array_map(fn($c) => $c['effective_score'], $scored)) / count($scored), 2) : null,
+            ];
+            if ($o['group'] === 'Продажи') $o += self::conversionByClient($oc);
+            $operators[] = $o;
+        }
         usort($operators, fn($a, $b) => $b['calls'] <=> $a['calls']);
+        $inGroup = fn(callable $p) => array_values(array_filter($operators, $p));
 
-        return ['date' => $date, 'groups' => $groups, 'operators' => $operators, 'total' => count($day)];
+        return [
+            'date'   => $date,
+            'groups' => $groups,
+            'total'  => count($day),
+            'operators_sales'   => $inGroup(fn($o) => $o['group'] === 'Продажи'),
+            'operators_service' => $inGroup(fn($o) => $o['group'] === 'Сервис'),
+            'operators_other'   => $inGroup(fn($o) => !in_array($o['group'], ['Продажи', 'Сервис'], true)),
+        ];
+    }
+
+    /**
+     * Конверсия в запись по уникальным клиентам.
+     * База — client_phone, у которого есть хотя бы один состоявшийся целевой звонок;
+     * в числителе — те из них, у кого есть хотя бы одна запись.
+     */
+    private static function conversionByClient(array $calls): array
+    {
+        $booked = [];
+        foreach ($calls as $c) {
+            if ($c['client_phone'] === '') continue;
+            if ($c['skipped_short'] || $c['is_target_call'] !== 'TRUE') continue;
+            $booked[$c['client_phone']] ??= false;
+            if ($c['is_appointment_booked'] === 'TRUE') $booked[$c['client_phone']] = true;
+        }
+        $target = count($booked);
+        $won    = count(array_filter($booked));
+        return [
+            'target'     => $target,   // уникальные клиенты с состоявшимся целевым звонком
+            'booked'     => $won,      // из них — с записью
+            'conversion' => $target ? round(100 * $won / $target, 1) : null,
+        ];
     }
 
     public function operatorsAndGroups(): array

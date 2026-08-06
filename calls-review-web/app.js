@@ -48,6 +48,8 @@ const app = createApp({
       summary.value = await api('api/summary?date=' + sumDate.value);
     };
     watch(sumDate, loadSummary);
+    const hasOperators = computed(() => ['operators_sales', 'operators_service', 'operators_other']
+      .some(k => (summary.value?.[k] || []).length));
 
     // ---------- список ----------
     const dicts = ref({ operators: [], groups: [] });
@@ -158,7 +160,7 @@ const app = createApp({
     });
 
     return { user, setUser, view, toast, PRESETS,
-      sumDate, summary, goGroup, goOperator,
+      sumDate, summary, hasOperators, goGroup, goOperator,
       dicts, f, list, loading, setPreset, setPeriod, sortBy, today, daysAgo,
       selected, toggle, togglePage, allPageSelected, selectAllFiltered, clearSel, confirmSelected, bulkBusy,
       card, openCard, closeCard, nav, cardIndex, trTab, verdict, sendVerdict, cardBusy,
@@ -201,29 +203,74 @@ const app = createApp({
             <div class="big mono">{{ g.calls }}<small>звонков</small></div>
             <div class="rows">
               <span>Средний балл: <b class="mono">{{ g.avg_score ?? '—' }}</b></span>
-              <span v-if="g.target !== undefined">Целевые / нецелевые: <b class="mono">{{ g.target }} / {{ g.non_target }}</b></span>
-              <span v-if="g.conversion !== undefined">Конверсия в запись: <b class="mono">{{ g.conversion ?? '—' }}%</b> ({{ g.booked }})</span>
+              <span>Вход. / исх.: <b class="mono">{{ g.inbound }} / {{ g.outbound }}</b></span>
+              <span v-if="g.unique_inbound !== undefined">Уник. входящих: <b class="mono">{{ g.unique_inbound }}</b></span>
+              <span v-if="g.target_calls !== undefined">Целевые / нецелевые: <b class="mono">{{ g.target_calls }} / {{ g.non_target }}</b></span>
+              <span v-if="g.conversion !== undefined" title="записей / уникальных целевых состоявшихся">Конверсия в запись:
+                <b class="mono">{{ g.conversion ?? '—' }}%</b> ({{ g.booked }} / {{ g.target }})</span>
               <span><span class="badge" :class="g.unreviewed ? 'warn' : 'ok'">непроверенных: {{ g.unreviewed }}</span></span>
             </div>
           </div>
         </div>
 
-        <div class="panel">
+        <div class="panel" v-if="!hasOperators">
           <h3>Нагрузка на операторов</h3>
-          <div v-if="!summary.operators.length" class="empty">За выбранный день звонков нет.</div>
-          <table v-else>
-            <thead><tr><th>Оператор</th><th>Группа</th><th class="num">Звонков</th><th class="num">Длительность</th><th class="num">Средний балл</th></tr></thead>
-            <tbody>
-              <tr v-for="o in summary.operators" :key="o.operator" style="cursor:pointer" @click="goOperator(o.operator, summary.date)">
-                <td>{{ o.operator }}</td>
-                <td><span class="badge neutral">{{ o.group }}</span></td>
-                <td class="num mono">{{ o.calls }}</td>
-                <td class="num mono">{{ o.duration }}</td>
-                <td class="num"><score-cell :value="o.avg_score"/></td>
-              </tr>
-            </tbody>
-          </table>
+          <div class="empty">За выбранный день звонков нет.</div>
         </div>
+        <template v-else>
+          <div class="panel" v-if="summary.operators_sales.length">
+            <h3>Нагрузка на операторов · Продажи</h3>
+            <table>
+              <thead><tr>
+                <th>Оператор</th><th class="num">Звонков</th><th class="num">Уникальных</th>
+                <th class="num">Записей</th><th class="num">Конверсия</th>
+                <th class="num">Общее время</th><th class="num">Средний балл</th>
+              </tr></thead>
+              <tbody>
+                <tr v-for="o in summary.operators_sales" :key="o.operator" style="cursor:pointer" @click="goOperator(o.operator, summary.date)">
+                  <td>{{ o.operator }}</td>
+                  <td class="num mono">{{ o.calls }}</td>
+                  <td class="num mono">{{ o.target }}</td>
+                  <td class="num mono">{{ o.booked }}</td>
+                  <td class="num mono">{{ o.conversion === null ? '—' : o.conversion + '%' }}</td>
+                  <td class="num mono">{{ o.duration }}</td>
+                  <td class="num"><score-cell :value="o.avg_score"/></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="panel" v-if="summary.operators_service.length">
+            <h3>Нагрузка на операторов · Сервис</h3>
+            <table>
+              <thead><tr><th>Оператор</th><th class="num">Звонков</th><th class="num">Общее время</th><th class="num">Средний балл</th></tr></thead>
+              <tbody>
+                <tr v-for="o in summary.operators_service" :key="o.operator" style="cursor:pointer" @click="goOperator(o.operator, summary.date)">
+                  <td>{{ o.operator }}</td>
+                  <td class="num mono">{{ o.calls }}</td>
+                  <td class="num mono">{{ o.duration }}</td>
+                  <td class="num"><score-cell :value="o.avg_score"/></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="panel" v-if="summary.operators_other.length">
+            <h3>Нагрузка на операторов · Прочие</h3>
+            <table>
+              <thead><tr><th>Оператор</th><th>Группа</th><th class="num">Звонков</th><th class="num">Общее время</th><th class="num">Средний балл</th></tr></thead>
+              <tbody>
+                <tr v-for="o in summary.operators_other" :key="o.operator" style="cursor:pointer" @click="goOperator(o.operator, summary.date)">
+                  <td>{{ o.operator }}</td>
+                  <td><span class="badge neutral">{{ o.group }}</span></td>
+                  <td class="num mono">{{ o.calls }}</td>
+                  <td class="num mono">{{ o.duration }}</td>
+                  <td class="num"><score-cell :value="o.avg_score"/></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
       </template>
     </div>
 
@@ -272,10 +319,10 @@ const app = createApp({
                 <span v-if="c.skipped_short" class="badge neutral">не состоялся</span>
                 <score-cell v-else :value="c.effective_score" :old="c.review_status==='SCORE_CHANGED' ? c.overall_score : undefined"/>
               </td>
-              <td>
+              <td class="status-cell">
+                <span v-if="c.is_problem_call==='TRUE'" class="badge bad">проблемный</span>
                 <span v-if="c.review_status==='CONFIRMED'" class="badge ok">подтверждено</span>
                 <span v-else-if="c.review_status==='SCORE_CHANGED'" class="badge ok">оценка изменена</span>
-                <span v-else-if="c.is_problem_call==='TRUE'" class="badge bad">проблемный</span>
                 <span v-else-if="c.reviewable" class="badge warn">не проверено</span>
                 <span v-else class="badge neutral">{{ c.has_analysis ? '—' : 'нет анализа' }}</span>
               </td>
@@ -316,6 +363,15 @@ const app = createApp({
             <div><div class="k">Направление · длительность</div>{{ dirLabel(card.direction) }} · <span class="mono">{{ card.call_duration || '—' }}</span></div>
             <div><div class="k">Оценка</div><score-cell :value="card.effective_score" :old="card.review_status==='SCORE_CHANGED' ? card.overall_score : undefined"/></div>
             <div><div class="k">Целевой · запись</div>{{ card.is_target_call==='TRUE'?'да':card.is_target_call==='FALSE'?'нет':'—' }} · {{ card.is_appointment_booked==='TRUE'?'записан':'нет' }}</div>
+            <div><div class="k">Статус</div>
+              <div class="status-cell">
+                <span v-if="card.is_problem_call==='TRUE'" class="badge bad">проблемный</span>
+                <span v-if="card.review_status==='CONFIRMED'" class="badge ok">подтверждено</span>
+                <span v-else-if="card.review_status==='SCORE_CHANGED'" class="badge ok">оценка изменена</span>
+                <span v-else-if="card.reviewable" class="badge warn">не проверено</span>
+                <span v-else class="badge neutral">{{ card.has_analysis ? '—' : 'нет анализа' }}</span>
+              </div>
+            </div>
             <div><div class="k">Запись разговора</div><a v-if="card.drive_url" :href="card.drive_url" target="_blank" rel="noopener">Открыть в Drive ↗</a><span v-else>—</span></div>
           </div>
 

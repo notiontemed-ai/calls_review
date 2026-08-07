@@ -211,11 +211,18 @@ const app = createApp({
             <div class="rows">
               <span>Средний балл: <b class="mono">{{ g.avg_score ?? '—' }}</b></span>
               <span>Вход. / исх.: <b class="mono">{{ g.inbound }} / {{ g.outbound }}</b></span>
-              <span v-if="g.unique_inbound !== undefined">Уник. входящих: <b class="mono">{{ g.unique_inbound }}</b></span>
-              <span v-if="g.target_calls !== undefined">Целевые / нецелевые: <b class="mono">{{ g.target_calls }} / {{ g.non_target }}</b></span>
-              <span v-if="g.unique_target !== undefined" title="уникальные клиенты: целевой — есть хотя бы один целевой звонок за день; нецелевой — только нецелевые">Уник. целевые / нецелевые: <b class="mono">{{ g.unique_target }} / {{ g.unique_non_target }}</b></span>
-              <span v-if="g.conversion !== undefined" title="записавшихся / уникальных целевых клиентов">Конверсия по уник. целевым:
-                <b class="mono">{{ g.conversion ?? '—' }}%</b> ({{ g.booked }} / {{ g.target }})</span>
+              <template v-if="g.sales_inbound">
+                <span class="subhead">Входящие</span>
+                <span>Звонков: <b class="mono">{{ g.sales_inbound.calls }}</b> · уник. клиентов: <b class="mono">{{ g.sales_inbound.unique_clients }}</b></span>
+                <span>Целевые / нецелевые: <b class="mono">{{ g.sales_inbound.target_calls }} / {{ g.sales_inbound.non_target }}</b></span>
+                <span title="уникальные клиенты: целевой — есть хотя бы один целевой входящий за день; нецелевой — только нецелевые">Уник. целевые / нецелевые: <b class="mono">{{ g.sales_inbound.unique_target }} / {{ g.sales_inbound.unique_non_target }}</b></span>
+                <span title="записавшихся / уникальных целевых клиентов">Конверсия по уник. целевым: <b class="mono">{{ g.sales_inbound.conversion ?? '—' }}%</b> ({{ g.sales_inbound.booked }} / {{ g.sales_inbound.target }})</span>
+                <span class="subhead">Исходящие</span>
+                <span>Звонков: <b class="mono">{{ g.sales_outbound.calls }}</b> · уник. клиентов: <b class="mono">{{ g.sales_outbound.unique_clients }}</b></span>
+                <span>Целевые / нецелевые: <b class="mono">{{ g.sales_outbound.target_calls }} / {{ g.sales_outbound.non_target }}</b></span>
+                <span title="уникальные клиенты: целевой — есть хотя бы один целевой исходящий за день; нецелевой — только нецелевые">Уник. целевые / нецелевые: <b class="mono">{{ g.sales_outbound.unique_target }} / {{ g.sales_outbound.unique_non_target }}</b></span>
+                <span title="записавшихся / уникальных целевых клиентов">Конверсия по уник. целевым: <b class="mono">{{ g.sales_outbound.conversion ?? '—' }}%</b> ({{ g.sales_outbound.booked }} / {{ g.sales_outbound.target }})</span>
+              </template>
               <span><span class="badge" :class="g.unreviewed ? 'warn' : 'ok'">непроверенных: {{ g.unreviewed }}</span></span>
             </div>
           </div>

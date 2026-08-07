@@ -196,25 +196,10 @@ final class Data
                 'unreviewed' => count(array_filter($gc, fn($c) => $c['reviewable'] && $c['review_status'] === '')),
             ];
             if ($g === 'Продажи') {
-                // Целевые/нецелевые — по звонкам; конверсия и уникальные — по клиентам.
-                $row['target_calls'] = count(array_filter($gc, fn($c) => $c['is_target_call'] === 'TRUE'));
-                $row['non_target']   = count(array_filter($gc, fn($c) => $c['is_target_call'] === 'FALSE'));
-                $row['unique_inbound'] = count(array_unique(array_map(
-                    fn($c) => $c['client_phone'],
-                    array_filter($gc, fn($c) => $c['direction'] === 'INBOUND' && $c['client_phone'] !== '')
-                )));
-                $row += self::conversionByClient($gc);
-                // Уникальные клиенты (взаимоисключающе): целевой — есть хотя бы один
-                // целевой звонок за день; нецелевой — целевых нет, есть нецелевые.
-                // unique_target совпадает с базой конверсии (target).
-                $row['unique_target'] = $row['target'];
-                $hasTarget = [];
-                foreach ($gc as $c) {
-                    if ($c['client_phone'] === '' || $c['skipped_short']) continue;
-                    if ($c['is_target_call'] === 'TRUE') $hasTarget[$c['client_phone']] = true;
-                    elseif ($c['is_target_call'] === 'FALSE') $hasTarget[$c['client_phone']] ??= false;
-                }
-                $row['unique_non_target'] = count(array_filter($hasTarget, fn($t) => !$t));
+                // Метрики продаж раздельно по направлениям: клиент со входящим
+                // и исходящим звонком попадает в оба блока — базы независимы.
+                $row['sales_inbound']  = self::salesDirectionStats(array_values(array_filter($gc, fn($c) => $c['direction'] === 'INBOUND')));
+                $row['sales_outbound'] = self::salesDirectionStats(array_values(array_filter($gc, fn($c) => $c['direction'] === 'OUTBOUND')));
             }
             $groups[] = $row;
         }
@@ -250,6 +235,35 @@ final class Data
             'operators_service' => $inGroup(fn($o) => $o['group'] === 'Сервис'),
             'operators_other'   => $inGroup(fn($o) => !in_array($o['group'], ['Продажи', 'Сервис'], true)),
         ];
+    }
+
+    /**
+     * Метрики продаж по одному направлению (входящие или исходящие).
+     * Звонки: всего и целевые/нецелевые. Клиенты (уникальные client_phone,
+     * взаимоисключающе): целевой — есть хотя бы один целевой звонок этого
+     * направления за день; нецелевой — целевых нет, есть нецелевые.
+     * Конверсия — по уникальным целевым (совпадают с базой conversionByClient).
+     */
+    private static function salesDirectionStats(array $calls): array
+    {
+        $stats = [
+            'calls'          => count($calls),
+            'unique_clients' => count(array_unique(array_map(
+                fn($c) => $c['client_phone'],
+                array_filter($calls, fn($c) => $c['client_phone'] !== '')
+            ))),
+            'target_calls' => count(array_filter($calls, fn($c) => $c['is_target_call'] === 'TRUE')),
+            'non_target'   => count(array_filter($calls, fn($c) => $c['is_target_call'] === 'FALSE')),
+        ];
+        $hasTarget = [];
+        foreach ($calls as $c) {
+            if ($c['client_phone'] === '' || $c['skipped_short']) continue;
+            if ($c['is_target_call'] === 'TRUE') $hasTarget[$c['client_phone']] = true;
+            elseif ($c['is_target_call'] === 'FALSE') $hasTarget[$c['client_phone']] ??= false;
+        }
+        $stats['unique_target']     = count(array_filter($hasTarget));
+        $stats['unique_non_target'] = count($hasTarget) - $stats['unique_target'];
+        return $stats + self::conversionByClient($calls);
     }
 
     /**

@@ -53,6 +53,11 @@ const CONFIG = {
 
   N8N_WEBHOOK_URL: 'https://n8n-x3.tech.temed.ru/webhook/mango-call-transcribe-stereo-safe-v2',
 
+  // Приём справочника сотрудников. Вебхук того же workflow транскрибации:
+  // справочник кладётся в его staticData, а staticData между workflow
+  // не разделяется — отдельный workflow тут не годится.
+  N8N_EMPLOYEES_WEBHOOK_URL: 'https://n8n-x3.tech.temed.ru/webhook/employees-directory',
+
   // Имя заголовка и токен. То же имя и значение — в Header Auth credential в n8n:
   N8N_SECRET_HEADER: 'X-TEMED-CALLS-SECRET',
   N8N_SECRET: PropertiesService.getScriptProperties().getProperty('N8N_SECRET')
@@ -330,6 +335,7 @@ function onOpen() {
     .addItem('Автоотправка: выключить', 'deleteAutoSendTrigger')
     .addSeparator()
     .addItem('Обновить сотрудников из Битрикс', 'refreshEmployeesFromBitrix')
+    .addItem('Отправить справочник в n8n сейчас', 'pushEmployeesDirectoryToN8nNow')
     .addItem('Пересчитать операторов', 'recalculateOperatorNames')
     .addItem('Обновить mango side', 'updateMangoSideList')
     .addItem(
@@ -1031,9 +1037,14 @@ function sendTranscriptionRow_(sheet, rowNumber, row, headerMap, push) {
     drive_file_id: getCellByHeader_(row, headerMap, 'drive_file_id'),
     drive_url: getCellByHeader_(row, headerMap, 'drive_url'),
 
-    // Справочник сотрудников для матчинга requested_specialist и
-    // appointment_specialist в n8n. AI список НЕ получает: сопоставление
-    // идёт кодом по этому снимку.
+    // ПЕРЕХОДНОЕ ПОЛЕ, УДАЛИТЬ ЧЕРЕЗ НЕДЕЛЮ ПОСЛЕ ДЕПЛОЯ.
+    // Справочник теперь живёт в staticData workflow (пуш раз в сутки на
+    // /webhook/employees-directory), и нода Prepare Sheet Update читает
+    // его оттуда. Здесь снимок остаётся только как fallback на время,
+    // пока staticData ещё не заполнен. Вместе с этим полем убирается
+    // fallback `meta.employees` в ноде Prepare Sheet Update — иначе
+    // трафик payload (десятки МБ в день) никуда не денется.
+    // AI список НЕ получает: сопоставление идёт кодом по снимку.
     employees: employees,
 
     // Результат n8n пишет в таблицу сам, поэтому callback не передаётся.
@@ -1912,6 +1923,19 @@ const SHEET_LOCK_TIMEOUT_MS = 30000;
 
 const EMPLOYEES_TRIGGER_HANDLER = 'refreshEmployeesFromBitrix';
 
+// Кто попадает в справочник, уезжающий в n8n. Матчинг специалистов имеет
+// смысл только для тех, к кому записывают на приём, поэтому из полного
+// снимка листа берётся подмножество: активные сотрудники, в должности
+// которых встречается одна из подстрок (регистр и «ё» не важны, позиция
+// в строке любая — «Врач-невролог», «Инструктор ЛФК», «физиотерапевт»).
+//
+// ВНИМАНИЕ: фильтр сужает матчинг. Должности вне списка («массажист»,
+// «невролог» без слова «врач») перестанут матчиться — перед правкой
+// сверяйтесь с уникальными work_position на листе «Сотрудники».
+// Тот же список продублирован в ноде n8n Receive Employees Directory:
+// приёмник не доверяет присланному и фильтрует сам.
+const EMPLOYEES_DIRECTORY_POSITION_PATTERNS = ['врач', 'лфк', 'терапевт', 'реабилитолог'];
+
 // Сколько изменений перечислять в details события OPERATOR_RECALC_FINISH.
 // Пособытийный лог на строку не пишем: на сотнях строк он раздувает «Лог».
 const OPERATOR_RECALC_LOG_SAMPLE_LIMIT = 20;
@@ -1984,6 +2008,7 @@ function refreshEmployeesFromBitrix() {
     const updatedAt = nowString_();
 
     const rows = [];
+    const employees = [];
     let activeCount = 0;
     let skippedNoName = 0;
 
@@ -1998,6 +2023,8 @@ function refreshEmployeesFromBitrix() {
 
       if (employee.active) activeCount++;
 
+      employees.push(employee);
+
       rows.push(EMPLOYEES_HEADERS.map(function(header) {
         return employee[header];
       }));
@@ -2009,6 +2036,12 @@ function refreshEmployeesFromBitrix() {
 
     // Снимок изменился — кэш рана больше не актуален.
     EMPLOYEES_CACHE_ = null;
+
+    // Пуш справочника в staticData n8n. Инициатор — этот суточный триггер;
+    // приёмник в n8n дополнительно отбивает всё, что чаще 23 часов.
+    // Неуспех POST лист не откатывает: снимок уже записан и корректен,
+    // n8n доедет следующим суткам или ручным пунктом меню.
+    pushEmployeesDirectoryToN8n_(employees, false, push);
 
     const message = 'Обновлено сотрудников: ' + rows.length + ', активных: ' + activeCount +
       (skippedNoName ? ', пропущено без ФИО: ' + skippedNoName : '');
@@ -2220,6 +2253,184 @@ function deleteEmployeesDailyRefreshTriggers_() {
   });
 
   return removed;
+}
+
+/************************************************************
+ * СПРАВОЧНИК → STATICDATA N8N
+ *
+ * Раньше снимок листа «Сотрудники» ехал в payload КАЖДОГО звонка —
+ * это десятки мегабайт UrlFetch-трафика в день на пустом месте.
+ * Теперь справочник уходит в n8n раз в сутки (после обновления листа
+ * из Битрикс) и живёт в staticData workflow транскрибации.
+ *
+ * Частота: инициирует один суточный триггер, приёмник в n8n дополнительно
+ * отбивает всё, что чаще 23 часов. Ручное внеплановое обновление — пункт
+ * меню «Отправить справочник в n8n сейчас» (force: true).
+ ************************************************************/
+
+/**
+ * Пункт меню: внеплановый пуш справочника с обходом суточного гейта.
+ * Нужен после переимпорта workflow в n8n — staticData при экспорте
+ * и импорте не переносится, справочник приходится класть заново.
+ */
+function pushEmployeesDirectoryToN8nNow() {
+  const runId = 'employees-push-' + Date.now();
+  const log = [];
+
+  const push = function(step, file, details) {
+    log.push([
+      nowString_(),
+      runId,
+      String(step || ''),
+      String(file || '').slice(0, 300),
+      String(details || '').slice(0, 2000)
+    ]);
+  };
+
+  try {
+    const employees = loadEmployeesFromSheet_(push);
+
+    if (!employees.length) {
+      showToast_('Лист «' + CONFIG.EMPLOYEES_SHEET_NAME + '» пуст: отправлять нечего.');
+      return;
+    }
+
+    const result = pushEmployeesDirectoryToN8n_(employees, true, push);
+
+    showToast_(
+      result.ok
+        ? 'Справочник отправлен в n8n: ' + result.sent + ' сотрудников. ' + result.response
+        : 'Справочник в n8n не отправлен: ' + result.response
+    );
+  } finally {
+    flushLog_(log);
+  }
+}
+
+/**
+ * Активные сотрудники, к которым записывают на приём. Остальные строки
+ * листа матчингу специалистов не нужны и в n8n не уезжают.
+ */
+function filterEmployeesForDirectory_(employees) {
+  return (employees || []).filter(function(employee) {
+    if (!employee) return false;
+
+    if (!String(employee.full_name || '').trim()) return false;
+
+    if (!parseEmployeeBoolean_(employee.active)) return false;
+
+    const position = String(employee.work_position || '').toLowerCase().replace(/ё/g, 'е');
+
+    return EMPLOYEES_DIRECTORY_POSITION_PATTERNS.some(function(pattern) {
+      return position.indexOf(pattern) !== -1;
+    });
+  });
+}
+
+/**
+ * Тело пуша: только исходные поля ФИО. Нормализованные формы n8n считает
+ * сам при приёме — так они гарантированно посчитаны одним кодом и не
+ * едут по сети дважды.
+ */
+function buildEmployeesDirectoryPayload_(employees) {
+  return (employees || []).map(function(employee) {
+    return {
+      bitrix_user_id: employee.bitrix_user_id,
+      active: true,
+      full_name: employee.full_name,
+      short_name: employee.short_name,
+      last_name: employee.last_name,
+      name: employee.name,
+      second_name: employee.second_name,
+      work_position: employee.work_position
+    };
+  });
+}
+
+/**
+ * POST справочника в n8n. Ничего не бросает: неуспех — это событие
+ * EMPLOYEES_PUSH_ERROR в «Логе», а не сорванное обновление листа.
+ *
+ * Возвращает { ok, sent, response } для тоста и лога.
+ */
+function pushEmployeesDirectoryToN8n_(employees, force, push) {
+  const log = typeof push === 'function' ? push : function() {};
+
+  const url = String(CONFIG.N8N_EMPLOYEES_WEBHOOK_URL || '').trim();
+
+  if (!url) {
+    log('EMPLOYEES_PUSH_ERROR', '', 'Не задан CONFIG.N8N_EMPLOYEES_WEBHOOK_URL — справочник не отправлен.');
+    return { ok: false, sent: 0, response: 'не задан N8N_EMPLOYEES_WEBHOOK_URL' };
+  }
+
+  const filtered = filterEmployeesForDirectory_(employees);
+
+  if (!filtered.length) {
+    log(
+      'EMPLOYEES_PUSH_ERROR',
+      '',
+      'Под фильтр справочника не попал ни один сотрудник (активные с должностями: ' +
+        EMPLOYEES_DIRECTORY_POSITION_PATTERNS.join(', ') + '). ' +
+        'Пуш отменён, чтобы не затереть справочник в n8n пустым списком.'
+    );
+
+    return { ok: false, sent: 0, response: 'пустой справочник после фильтра' };
+  }
+
+  const body = JSON.stringify({
+    action: 'employees_directory',
+    force: force === true,
+    employees: buildEmployeesDirectoryPayload_(filtered)
+  });
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: body,
+    muteHttpExceptions: true,
+    headers: {}
+  };
+
+  options.headers[CONFIG.N8N_SECRET_HEADER] = CONFIG.N8N_SECRET;
+
+  log(
+    'EMPLOYEES_PUSH_REQUEST',
+    '',
+    'POST ' + url + ': ' + filtered.length + ' сотрудников из ' + (employees || []).length +
+      ', ' + payloadSizeBytes_(body) + ' байт, force: ' + (force === true)
+  );
+
+  let response;
+
+  try {
+    response = UrlFetchApp.fetch(url, options);
+  } catch (e) {
+    log('EMPLOYEES_PUSH_ERROR', '', 'СЕТЬ: ' + String((e && e.stack) || e));
+    return { ok: false, sent: 0, response: 'сеть недоступна' };
+  }
+
+  const statusCode = response.getResponseCode();
+  const responseText = response.getContentText();
+
+  if (statusCode < 200 || statusCode >= 300) {
+    log(
+      'EMPLOYEES_PUSH_ERROR',
+      '',
+      'n8n вернул HTTP ' + statusCode + ': ' + shortResponseText_(responseText) +
+        (httpStatusHint_(statusCode, url) ? '. ' + httpStatusHint_(statusCode, url) : '')
+    );
+
+    return { ok: false, sent: 0, response: 'HTTP ' + statusCode };
+  }
+
+  log(
+    'EMPLOYEES_PUSH_OK',
+    '',
+    'Справочник отправлен: ' + filtered.length + ' сотрудников, ответ n8n: ' +
+      shortResponseText_(responseText)
+  );
+
+  return { ok: true, sent: filtered.length, response: shortResponseText_(responseText) };
 }
 
 /************************************************************

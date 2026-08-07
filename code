@@ -727,18 +727,10 @@ function sendNewCallsToTranscriptionN8nLocked_(maxToSend) {
         ', analysis_system_prompt: ' + (prompts.analysis_system_prompt ? 'задан' : 'по умолчанию из n8n')
     );
 
-    // Снимок справочника сотрудников для n8n: он матчит requested_specialist
-    // сам, поэтому получает employees в теле каждого запроса. Лист читается
-    // один раз за ран (кэш в EMPLOYEES_CACHE_), пустой справочник отправку
-    // не блокирует — предупреждение уже ушло в «Лог».
-    const employees = loadEmployeesFromSheet_(push);
-
-    push(
-      'EMPLOYEES',
-      '',
-      'Справочник сотрудников: ' + employees.length + ' записей, активных: ' +
-        employees.filter(function(employee) { return employee.active; }).length
-    );
+    // Лист «Сотрудники» при отправке больше не читается: справочник для
+    // матчинга специалистов лежит в staticData n8n и обновляется отдельным
+    // суточным пушем. Матчинг operator_name живёт в скане — там справочник
+    // по-прежнему читается с листа.
 
     const sheet = getOrCreateSheet_();
     ensureHeaders_(sheet);
@@ -1005,10 +997,10 @@ function sendTranscriptionRow_(sheet, rowNumber, row, headerMap, push) {
   // и закэшированы, поэтому лист «Промпты» читается один раз за запуск.
   const prompts = loadPrompts_();
 
-  // Снимок справочника для матчинга специалистов в n8n.
-  // Лист уже прочитан в начале отправки — здесь отдаётся кэш рана.
-  const employees = buildEmployeesPayload_(loadEmployeesFromSheet_(log));
-
+  // Справочника сотрудников в payload нет: он живёт в staticData workflow
+  // (пуш раз в сутки на /webhook/employees-directory), нода Prepare Sheet
+  // Update читает его оттуда. Возить снимок в каждом звонке — это и были
+  // те десятки МБ UrlFetch-трафика в день, ради которых всё затевалось.
   const payload = {
     action: 'transcribe_and_analyze_call',
 
@@ -1036,16 +1028,6 @@ function sendTranscriptionRow_(sheet, rowNumber, row, headerMap, push) {
 
     drive_file_id: getCellByHeader_(row, headerMap, 'drive_file_id'),
     drive_url: getCellByHeader_(row, headerMap, 'drive_url'),
-
-    // ПЕРЕХОДНОЕ ПОЛЕ, УДАЛИТЬ ЧЕРЕЗ НЕДЕЛЮ ПОСЛЕ ДЕПЛОЯ.
-    // Справочник теперь живёт в staticData workflow (пуш раз в сутки на
-    // /webhook/employees-directory), и нода Prepare Sheet Update читает
-    // его оттуда. Здесь снимок остаётся только как fallback на время,
-    // пока staticData ещё не заполнен. Вместе с этим полем убирается
-    // fallback `meta.employees` в ноде Prepare Sheet Update — иначе
-    // трафик payload (десятки МБ в день) никуда не денется.
-    // AI список НЕ получает: сопоставление идёт кодом по снимку.
-    employees: employees,
 
     // Результат n8n пишет в таблицу сам, поэтому callback не передаётся.
     prompts: prompts
@@ -1888,9 +1870,9 @@ function createDefaultPromptsSheet_() {
  * Кто чем пользуется:
  *   • ФИО оператора матчит скан (scanMangoRecordingsFolder) по этому листу,
  *     с учётом ручного маппинга на листе «Операторы»;
- *   • requested_specialist и appointment_specialist матчит n8n — снимок
- *     листа уезжает в payload как employees, потому что результат n8n
- *     пишет в таблицу напрямую.
+ *   • requested_specialist и appointment_specialist матчит n8n — туда
+ *     отфильтрованный справочник уходит раз в сутки и живёт в staticData
+ *     workflow. В payload звонка справочника нет.
  *
  * AI список сотрудников НЕ получает и ФИО не сопоставляет: свободная
  * генерация модели не источник истины для фамилий.
@@ -2531,25 +2513,6 @@ function loadEmployeesFromSheet_(push) {
   EMPLOYEES_CACHE_ = employees;
 
   return EMPLOYEES_CACHE_;
-}
-
-/**
- * Снимок справочника для payload в n8n — только поля, нужные матчингу.
- * Остальные колонки листа в тело запроса не уезжают.
- */
-function buildEmployeesPayload_(employees) {
-  return (employees || []).map(function(employee) {
-    return {
-      bitrix_user_id: employee.bitrix_user_id,
-      active: !!employee.active,
-      full_name: employee.full_name,
-      full_name_normalized: employee.full_name_normalized,
-      short_name_normalized: employee.short_name_normalized,
-      name_patronymic_normalized: employee.name_patronymic_normalized,
-      last_name_normalized: employee.last_name_normalized,
-      work_position: employee.work_position
-    };
-  });
 }
 
 /**

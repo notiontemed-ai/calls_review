@@ -64,7 +64,11 @@ a{color:var(--accent)}
 .status-cell .badge{margin:1px 4px 1px 0;vertical-align:middle}
 
 /* ---------- таблицы ---------- */
-.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);overflow:clip}
+/* overflow:clip, а не hidden: hidden делает .panel scroll-контейнером и ломает
+   position:sticky у th — шапка липнет к верху карточки со сдвигом top:56px
+   и строки просвечивают над ней. clip обрезает скругления так же, но
+   sticky-контекст не создаёт: th липнет к окну под topbar, как задумано. */
 .panel h3{margin:0;padding:14px 18px;border-bottom:1px solid var(--line);font-size:1em}
 .panel + .panel{margin-top:18px}
 table{width:100%;border-collapse:separate;border-spacing:0;font-size:.92em}
